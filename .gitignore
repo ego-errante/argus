@@ -1,0 +1,16 @@
+# Rust
+/target
+
+# Node
+**/node_modules
+agent/dist
+
+# Secrets & env (NEVER commit — see ADR 0002)
+.env
+secrets/
+
+# Lifecycle store (regenerated per Run)
+*.db
+logs/*.db
+
+.DS_Store

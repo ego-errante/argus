@@ -1,0 +1,21 @@
+# Argus — Core (Rust) + Agent (TS), the clean-separation boundary made physical.
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    env_file: .env
+    ports:
+      - "8787:8787"
+
+  core:
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    env_file: .env
+    environment:
+      - AGENT_URL=http://agent:8787/decide
+    depends_on:
+      - agent
+    volumes:
+      - ./logs:/app/logs

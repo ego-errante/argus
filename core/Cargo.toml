@@ -1,0 +1,39 @@
+[package]
+name = "argus-core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "argus-core"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json"] }
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+solana-sdk = "4.0.1"
+bincode = "1"
+base64 = "0.22.1"
+bs58 = "0.5.1"
+solana-system-interface = { version = "3.2.0", features = ["bincode"] }
+jito-sdk-rust = "0.3.2"
+yellowstone-grpc-client = "13.1.1"
+yellowstone-grpc-proto = "12.4.0"
+futures = "0.3.32"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# Added during the PLAN.md milestones — kept out of the initial build so
+# `cargo build` works before infra integration. Pin versions against your
+# toolchain when you add them (Day 1-2 tracer bullet):
+#   yellowstone-grpc-client, yellowstone-grpc-proto   (streaming)
+#   solana-sdk, solana-client                         (tx construction)
+#   jito-sdk-rust  OR  Jito JSON-RPC over reqwest      (bundles)
+#   tonic, prost                                       (gRPC transport)
