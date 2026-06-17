@@ -1,16 +1,31 @@
-//! Leader Window detection (PLAN.md Day 5-6, promoted for ADR 0007's Jito-first path).
+//! Leader Window detection (PLAN.md Day 5-6, ADR 0008) over gRPC.
 //!
-//! Queries the Jito Block Engine `getNextScheduledLeader` for the next slot a
-//! Jito-connected validator is scheduled to lead, so the Core can time Submission
-//! into that window (the spec's "Detect the correct leader window for submission").
+//! Queries Jito's `searcher.SearcherService/GetNextScheduledLeader` for the next
+//! slot a Jito-connected validator is scheduled to lead, so the Core can time
+//! Submission into that window (the spec's "Detect the correct leader window for
+//! submission"). This method is gRPC-ONLY — it is not on Jito's HTTP JSON-RPC API
+//! (verified against jito-labs/mev-protos) — and is served NoAuth for read calls.
 //!
 //! This is an OPTIMIZATION signal, never a gate: a failed/empty response logs a
 //! warning and the caller submits anyway. The authoritative current-slot signal in
-//! the full lifecycle is the Yellowstone slot stream (Day 3-4); this RPC query is
-//! enough to align submission with the next Jito leader.
+//! the full lifecycle is the Yellowstone slot stream (Day 3-4).
 
-use anyhow::{anyhow, Result};
-use serde_json::Value;
+use anyhow::Result;
+use std::time::Duration;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+
+/// Bound the connect so a flaky/throttled searcher endpoint fails fast and the
+/// caller proceeds to submit without timing, rather than stalling the window.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Generated client + messages for the minimal `searcher.proto` (see build.rs).
+pub mod searcher_proto {
+    tonic::include_proto!("searcher");
+}
+use searcher_proto::{
+    searcher_service_client::SearcherServiceClient, NextScheduledLeaderRequest,
+    NextScheduledLeaderResponse,
+};
 
 /// The next slot a Jito-connected validator is scheduled to lead.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,85 +43,52 @@ impl NextLeader {
     }
 }
 
-/// Candidate sub-paths for the method. Jito hosts `getNextScheduledLeader` at its
-/// own path; we also try the `bundles` endpoint as a fallback so a routing change
-/// (or our uncertainty about the exact path) degrades to "submit without timing"
-/// rather than a hard failure.
-const LEADER_PATHS: [&str; 2] = ["getNextScheduledLeader", "bundles"];
-
-/// Parse a `getNextScheduledLeader` JSON-RPC response into a `NextLeader`.
-/// Tolerates Jito's camelCase wire field names; identity/region are best-effort.
-pub fn parse_next_leader(resp: &Value) -> Result<NextLeader> {
-    let r = &resp["result"];
-    if r.is_null() {
-        return Err(anyhow!("getNextScheduledLeader: no result ({resp})"));
+/// Pure mapping: the gRPC response -> our domain struct. No network, so it is
+/// unit-testable by constructing the proto message directly (cf. the
+/// `*_from_proto` helpers in `streaming.rs`).
+pub fn next_leader_from_proto(r: &NextScheduledLeaderResponse) -> NextLeader {
+    NextLeader {
+        current_slot: r.current_slot,
+        next_leader_slot: r.next_leader_slot,
+        next_leader_identity: r.next_leader_identity.clone(),
+        next_leader_region: r.next_leader_region.clone(),
     }
-    let current_slot = r["currentSlot"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("getNextScheduledLeader: no currentSlot ({resp})"))?;
-    let next_leader_slot = r["nextLeaderSlot"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("getNextScheduledLeader: no nextLeaderSlot ({resp})"))?;
-    Ok(NextLeader {
-        current_slot,
-        next_leader_slot,
-        next_leader_identity: r["nextLeaderIdentity"].as_str().unwrap_or("").to_string(),
-        next_leader_region: r["nextLeaderRegion"].as_str().unwrap_or("").to_string(),
-    })
 }
 
-/// Query the Block Engine for the next scheduled Jito leader. `auth_uuid` is the
-/// optional `x-jito-auth` UUID (read calls don't require it). Tries the dedicated
-/// path, then the bundles path; returns the first usable result.
-pub async fn next_scheduled_leader(
-    block_engine_base: &str,
-    auth_uuid: Option<&str>,
-) -> Result<NextLeader> {
-    let base = format!("{}/api/v1", block_engine_base.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getNextScheduledLeader",
-        "params": [],
-    });
-    let client = reqwest::Client::new();
-    let mut last_err = anyhow!("no leader endpoint tried");
-
-    for path in LEADER_PATHS {
-        let url = format!("{base}/{path}");
-        let mut req = client.post(&url).json(&body);
-        if let Some(uuid) = auth_uuid {
-            req = req.header("x-jito-auth", uuid);
-        }
-        match req.send().await {
-            Ok(http) => {
-                let resp: Value = match http.json().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        last_err = anyhow!("{url}: non-JSON response: {e}");
-                        continue;
-                    }
-                };
-                // Method-not-found at this path -> try the next candidate.
-                if resp["error"]["code"].as_i64() == Some(-32601) {
-                    last_err = anyhow!("{url}: method not found");
-                    continue;
-                }
-                match parse_next_leader(&resp) {
-                    Ok(nl) => return Ok(nl),
-                    Err(e) => {
-                        last_err = e;
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                last_err = anyhow!("{url}: {e}");
-                continue;
-            }
-        }
+/// Normalize a gRPC endpoint to a full URI, defaulting to `https://` when no
+/// scheme is present (mirrors `streaming::grpc_builder`'s scheme handling).
+fn searcher_endpoint_uri(raw: &str) -> String {
+    if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
     }
-    Err(last_err)
+}
+
+/// Connect a `SearcherServiceClient` over TLS (https) or plaintext (http). Reuses
+/// the process-wide ring `CryptoProvider` installed in `main.rs`; native roots come
+/// from the OS trust store (the Dockerfile installs `ca-certificates`).
+async fn connect_searcher(grpc_endpoint: &str) -> Result<SearcherServiceClient<Channel>> {
+    let mut endpoint =
+        Endpoint::from_shared(searcher_endpoint_uri(grpc_endpoint))?.connect_timeout(CONNECT_TIMEOUT);
+    if endpoint.uri().scheme_str() == Some("https") {
+        endpoint = endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    }
+    let channel = endpoint.connect().await?;
+    Ok(SearcherServiceClient::new(channel))
+}
+
+/// Query Jito's SearcherService over gRPC (NoAuth) for the next scheduled Jito
+/// leader. `regions` may be empty (defaults to the connected region). Optimization
+/// signal only — the caller treats `Err` as "submit without leader timing".
+pub async fn next_scheduled_leader(grpc_endpoint: &str, regions: &[String]) -> Result<NextLeader> {
+    let mut client = connect_searcher(grpc_endpoint).await?;
+    let resp = client
+        .get_next_scheduled_leader(NextScheduledLeaderRequest {
+            regions: regions.to_vec(),
+        })
+        .await?;
+    Ok(next_leader_from_proto(resp.get_ref()))
 }
 
 #[cfg(test)]
@@ -136,29 +118,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_jito_response() {
-        let resp = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": {
-                "currentSlot": 426400000u64,
-                "nextLeaderSlot": 426400003u64,
-                "nextLeaderIdentity": "J1to1eaderIdentityPubkey",
-                "nextLeaderRegion": "frankfurt"
-            }
-        });
-        let nl = parse_next_leader(&resp).expect("parse");
+    fn maps_next_leader_from_proto() {
+        let resp = NextScheduledLeaderResponse {
+            current_slot: 426_400_000,
+            next_leader_slot: 426_400_003,
+            next_leader_identity: "J1to1eaderIdentityPubkey".into(),
+            next_leader_region: "frankfurt".into(),
+        };
+        let nl = next_leader_from_proto(&resp);
         assert_eq!(nl.current_slot, 426_400_000);
         assert_eq!(nl.next_leader_slot, 426_400_003);
+        assert_eq!(nl.next_leader_identity, "J1to1eaderIdentityPubkey");
         assert_eq!(nl.next_leader_region, "frankfurt");
         assert_eq!(nl.slots_until_leader(), 3);
     }
 
     #[test]
-    fn errors_when_result_missing() {
-        let resp = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "error": { "code": -32601, "message": "Method not found" }
-        });
-        assert!(parse_next_leader(&resp).is_err(), "no result -> Err, not a panic");
+    fn endpoint_uri_defaults_scheme_to_https() {
+        assert_eq!(
+            searcher_endpoint_uri("frankfurt.mainnet.block-engine.jito.wtf"),
+            "https://frankfurt.mainnet.block-engine.jito.wtf"
+        );
+        // An explicit scheme is left untouched (plaintext gRPC stays http).
+        assert_eq!(searcher_endpoint_uri("http://localhost:1003"), "http://localhost:1003");
+        assert_eq!(
+            searcher_endpoint_uri("https://frankfurt.mainnet.block-engine.jito.wtf"),
+            "https://frankfurt.mainnet.block-engine.jito.wtf"
+        );
     }
 }

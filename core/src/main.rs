@@ -59,6 +59,12 @@ async fn main() -> Result<()> {
         return slot_stream_probe(&cfg).await;
     }
 
+    // Leader probe (ARGUS_LEADER=1): one NoAuth gRPC call to Jito's SearcherService
+    // getNextScheduledLeader — proves the leader-window timing path live (ADR 0008).
+    if std::env::var("ARGUS_LEADER").is_ok() {
+        return leader_probe(&cfg).await;
+    }
+
     // Lifecycle run (ARGUS_LIFECYCLE=1): submit ONE real bundle and track it through
     // both Yellowstone streams into SQLite (ADR 0004) — the Day 3-4 deliverable.
     if std::env::var("ARGUS_LIFECYCLE").is_ok() {
@@ -73,7 +79,7 @@ async fn main() -> Result<()> {
     info!(payer = %payer.pubkey(), "loaded fee-payer keypair");
 
     // Dynamic Base Tip from the Jito Tip Floor (ADR 0005 — no hardcoded tip).
-    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url).await?;
+    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, cfg.jito_tip_percentile).await?;
     let run_id = now_millis();
 
     let regions = bundle::regional_endpoints();
@@ -96,8 +102,10 @@ async fn main() -> Result<()> {
 
     let mut landed = false;
     for attempt in 1..=SUBMIT_ATTEMPTS {
-        // Leader-window detection (optimization signal — never blocks submission).
-        match leader::next_scheduled_leader(&cfg.jito_block_engine_url, auth).await {
+        // Leader-window detection over gRPC (optimization signal — never blocks
+        // submission; empty regions = the connected region). NoAuth, so `auth` is
+        // not consumed here but stays in scope for the bundle fan-out below.
+        match leader::next_scheduled_leader(&cfg.jito_searcher_grpc_url, &[]).await {
             Ok(nl) => {
                 let gap = nl.slots_until_leader();
                 info!(
@@ -115,7 +123,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                warn!(attempt, error = %e, "getNextScheduledLeader unavailable — submitting without leader timing")
+                warn!(attempt, error = %e, "getNextScheduledLeader (gRPC) unavailable — submitting without leader timing")
             }
         }
 
@@ -157,7 +165,11 @@ async fn main() -> Result<()> {
         let recent_blockhash = rpc::get_latest_blockhash(&cfg.rpc_http_url).await?;
         let nonce = format!("argus-tracer-{run_id}-sender");
         // Sender mandates a CU limit + priority fee, and a tip ≥ its route minimum.
-        let sender_tip = base_tip.max(sender::min_tip_lamports(cfg.helius_swqos_only));
+        let sender_tip = base_tip.max(sender::min_tip_lamports(
+            cfg.helius_swqos_only,
+            cfg.sender_dual_min_tip_lamports,
+            cfg.sender_swqos_min_tip_lamports,
+        ));
         let txs = bundle::build_bundle(&bundle::BundleParams {
             payer: &payer,
             recent_blockhash,
@@ -165,8 +177,8 @@ async fn main() -> Result<()> {
             tip_account: sender::tip_account(0),
             tip_lamports: sender_tip,
             self_transfer_lamports: 1,
-            compute_unit_limit: Some(20_000),
-            priority_fee_microlamports: Some(100_000),
+            compute_unit_limit: Some(cfg.sender_compute_unit_limit),
+            priority_fee_microlamports: Some(cfg.sender_priority_fee_microlamports),
         })?;
         let signature = txs[0].signatures[0].to_string();
         let explorer = format!("https://solscan.io/tx/{signature}");
@@ -203,7 +215,7 @@ async fn bundle_diagnostic(cfg: &config::Config) -> Result<()> {
 
     // Tip floor for context, but submit with a deliberately HIGH tip to rule the
     // tip out as the variable (override via ARGUS_DIAG_TIP lamports; default 0.001 SOL).
-    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url).await?;
+    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, cfg.jito_tip_percentile).await?;
     let diag_floor: u64 = std::env::var("ARGUS_DIAG_TIP")
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -269,6 +281,26 @@ async fn bundle_diagnostic(cfg: &config::Config) -> Result<()> {
     }
     if !landed {
         warn!(%explorer, "DIAG: bundle did not land — Invalid throughout = not forwarded (need authed relay); Pending = forwarded but lost");
+    }
+    Ok(())
+}
+
+/// Live leader-window probe (ARGUS_LEADER=1): one NoAuth gRPC call to Jito's
+/// `searcher.SearcherService/GetNextScheduledLeader`, logging the next Jito leader
+/// slot/region and the slot gap. Proves the Day 5-6 timing path end-to-end (TLS +
+/// gRPC + the regional host) the same way ARGUS_STREAM proves the Yellowstone path.
+async fn leader_probe(cfg: &config::Config) -> Result<()> {
+    info!(grpc = %cfg.jito_searcher_grpc_url, "LEADER: querying getNextScheduledLeader over gRPC (NoAuth)");
+    match leader::next_scheduled_leader(&cfg.jito_searcher_grpc_url, &[]).await {
+        Ok(nl) => info!(
+            current_slot = nl.current_slot,
+            next_leader_slot = nl.next_leader_slot,
+            region = %nl.next_leader_region,
+            identity = %nl.next_leader_identity,
+            slots_until = nl.slots_until_leader(),
+            "LEADER: ✅ next Jito leader"
+        ),
+        Err(e) => warn!(error = format!("{e:#}"), "LEADER: query failed (endpoint is best-effort)"),
     }
     Ok(())
 }
@@ -357,7 +389,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
     let payer = wallet::load_keypair(&cfg.keypair_path)?;
     info!(payer = %payer.pubkey(), "LIFECYCLE: loaded fee-payer keypair");
 
-    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url).await?;
+    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, cfg.jito_tip_percentile).await?;
     let run_id = format!("run-{}", now_millis());
     let attempt: i64 = 1;
     let nonce = format!("argus-{run_id}-jito-{attempt}");

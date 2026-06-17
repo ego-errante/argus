@@ -26,7 +26,8 @@ const TIP_ACCOUNTS: [&str; 10] = [
     "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
 ];
 
-/// Sender's documented minimum tips (lamports).
+/// Sender's documented minimum tips (lamports) — the DEFAULTS the config falls
+/// back to (`SENDER_DUAL_MIN_TIP_LAMPORTS` / `SENDER_SWQOS_MIN_TIP_LAMPORTS`).
 pub const DUAL_MIN_TIP_LAMPORTS: u64 = 200_000; // 0.0002 SOL (staked + Jito)
 pub const SWQOS_MIN_TIP_LAMPORTS: u64 = 5_000; //   0.000005 SOL (staked only)
 
@@ -35,12 +36,12 @@ pub fn tip_account(i: usize) -> Pubkey {
     Pubkey::from_str(TIP_ACCOUNTS[i % TIP_ACCOUNTS.len()]).expect("valid sender tip account")
 }
 
-/// The minimum tip for the selected route.
-pub fn min_tip_lamports(swqos_only: bool) -> u64 {
+/// The minimum tip for the selected route, given the configured per-route minimums.
+pub fn min_tip_lamports(swqos_only: bool, dual_min: u64, swqos_min: u64) -> u64 {
     if swqos_only {
-        SWQOS_MIN_TIP_LAMPORTS
+        swqos_min
     } else {
-        DUAL_MIN_TIP_LAMPORTS
+        dual_min
     }
 }
 
@@ -83,7 +84,8 @@ mod tests {
 
     #[test]
     fn min_tip_matches_route() {
-        assert_eq!(min_tip_lamports(false), DUAL_MIN_TIP_LAMPORTS);
-        assert_eq!(min_tip_lamports(true), SWQOS_MIN_TIP_LAMPORTS);
+        // Dual route -> dual min; staked-only route -> the (lower) swqos min.
+        assert_eq!(min_tip_lamports(false, 200_000, 5_000), 200_000);
+        assert_eq!(min_tip_lamports(true, 200_000, 5_000), 5_000);
     }
 }

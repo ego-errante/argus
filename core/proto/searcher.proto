@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+// Minimal, self-contained subset of Jito's searcher.proto — ONLY the read-only,
+// NoAuth RPCs Argus calls. Wire-compatible with Jito's Block Engine because the
+// package + service + method names and the field tags match their published
+// proto; the local Rust type names this generates are cosmetic. We deliberately
+// avoid pulling jito-protos / jito-searcher-client (they drag in a conflicting
+// solana-sdk); these messages use only primitive scalar fields.
+//
+// Source of truth: https://github.com/jito-labs/mev-protos (searcher.proto).
+package searcher;
+
+service SearcherService {
+  // Next slot a Jito-connected validator is scheduled to lead, for the given
+  // regions (empty = the connected region). NoAuth read call.
+  rpc GetNextScheduledLeader(NextScheduledLeaderRequest)
+      returns (NextScheduledLeaderResponse);
+
+  // Block Engine regions (useful diagnostic cross-check of our region list).
+  rpc GetRegions(GetRegionsRequest) returns (GetRegionsResponse);
+}
+
+message NextScheduledLeaderRequest {
+  // Defaults to the currently connected region if empty.
+  repeated string regions = 1;
+}
+
+message NextScheduledLeaderResponse {
+  uint64 current_slot         = 1;
+  uint64 next_leader_slot     = 2;
+  string next_leader_identity = 3; // base58 pubkey
+  string next_leader_region   = 4;
+}
+
+message GetRegionsRequest {}
+
+message GetRegionsResponse {
+  string current_region            = 1;
+  repeated string available_regions = 2;
+}

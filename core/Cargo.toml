@@ -3,6 +3,8 @@ name = "argus-core"
 version = "0.1.0"
 edition = "2021"
 
+build = "build.rs"
+
 [[bin]]
 name = "argus-core"
 path = "src/main.rs"
@@ -29,11 +31,17 @@ yellowstone-grpc-client = "13.1.1"
 yellowstone-grpc-proto = "12.4.0"
 futures = "0.3.32"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# gRPC client for Jito's searcher.SearcherService/GetNextScheduledLeader (Day 5-6,
+# ADR 0008). All three already resolve in the tree via yellowstone; we make them
+# direct + select TLS features. The tls-* features are mandatory — without them
+# Endpoint::tls_config doesn't compile.
+tonic = { version = "0.14.6", default-features = false, features = ["channel", "tls-ring", "tls-native-roots"] }
+tonic-prost = "0.14.6"
+prost = "0.14.4"
 
-# Added during the PLAN.md milestones — kept out of the initial build so
-# `cargo build` works before infra integration. Pin versions against your
-# toolchain when you add them (Day 1-2 tracer bullet):
-#   yellowstone-grpc-client, yellowstone-grpc-proto   (streaming)
-#   solana-sdk, solana-client                         (tx construction)
-#   jito-sdk-rust  OR  Jito JSON-RPC over reqwest      (bundles)
-#   tonic, prost                                       (gRPC transport)
+[build-dependencies]
+# Compile proto/searcher.proto at build time. protoc-bin-vendored ships a
+# prebuilt protoc (no system dependency — works in docker), the same path
+# yellowstone-grpc-proto already uses.
+tonic-prost-build = "0.14.6"
+protoc-bin-vendored = "3.2.0"
