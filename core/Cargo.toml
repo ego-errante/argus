@@ -18,7 +18,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["json"] }
+# rustls-tls (not the default native-tls): no system OpenSSL on any platform, and
+# consistent with the rustls stack already used for tonic/gRPC + the process-wide
+# ring provider installed in main. Keeps `docker compose build` (rust:1-slim) working.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
 solana-sdk = "4.0.1"
