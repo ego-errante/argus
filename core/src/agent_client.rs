@@ -13,12 +13,15 @@ pub struct FailureContext<'a> {
     pub attempt: u32,
     pub error_text: &'a str,
     pub tip_lamports: u64,
-    pub tip_floor_p50: u64,
-    pub tip_floor_p75: u64,
+    // Context the Agent reasons over, honestly optional: `None` means "couldn't fetch"
+    // (serialized as JSON `null`), never a fabricated 0/base — so the Agent can tell a
+    // real floor/slot from a missing one. Matches the already-optional fields below.
+    pub tip_floor_p50: Option<u64>,
+    pub tip_floor_p75: Option<u64>,
     pub blockhash_age_slots: Option<u64>,
     pub cu_limit: Option<u32>,
     pub cu_used: Option<u32>,
-    pub current_slot: u64,
+    pub current_slot: Option<u64>,
 }
 
 /// The Agent's structured decision + summarized thinking (the Reasoning Trace).
@@ -46,15 +49,17 @@ impl AgentClient {
     /// OpenRouter is genuinely slow (tens of seconds), so the default is generous
     /// (~45s); a truly dead Agent trips the timeout, which the caller turns into a
     /// loud, recorded fallback to the local policy rather than an indefinite hang.
-    pub fn new(url: impl Into<String>, timeout_secs: u64) -> Self {
+    pub fn new(url: impl Into<String>, timeout_secs: u64) -> Result<Self> {
+        // Propagate a builder failure rather than swallowing it into a no-timeout
+        // client — a silently-unbounded client would defeat ARGUS_AGENT_TIMEOUT_SECS
+        // and let a dead Agent hang the Run instead of degrading to the local fallback.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+            .build()?;
+        Ok(Self {
             http,
             url: url.into(),
-        }
+        })
     }
 
     pub async fn decide(&self, ctx: &FailureContext<'_>) -> Result<Decision> {

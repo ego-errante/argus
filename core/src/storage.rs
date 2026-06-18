@@ -25,6 +25,23 @@ fn warn_no_rows(rows: usize, op: &str, run_id: &str, attempt: i64, nonce: &str) 
     }
 }
 
+/// Add `column` to `table` if it isn't already present (idempotent). Reads
+/// `PRAGMA table_info` and `ALTER`s only when the column is absent. `table`/`column`/
+/// `decl` are compile-time constants at every call site — no SQL-injection surface
+/// (PRAGMA/ALTER can't bind identifiers as `?` params, hence the interpolation).
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = stmt
+        .query_map([], |r| r.get::<_, String>(1))? // column 1 = name
+        .collect::<rusqlite::Result<Vec<String>>>()?
+        .iter()
+        .any(|name| name == column);
+    if !present {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
+    Ok(())
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -93,7 +110,15 @@ impl Store {
 
     pub fn init_schema(&self) -> Result<()> {
         let sql = include_str!("../migrations/001_init.sql");
-        self.conn.lock().unwrap().execute_batch(sql)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(sql)?;
+        // Idempotent column guard for DBs created before a column existed: `CREATE TABLE
+        // IF NOT EXISTS` skips an existing table, so a newly-added column (here
+        // `decisions.model`, the ADR 0006 provenance field) would be missing on an old
+        // argus.db and every 9-column INSERT would fail `no such column: model`. This adds
+        // ONLY the missing column — a one-column guard, not a versioned migration framework
+        // (the Q4 grilling decision). Fresh DBs already have it from the CREATE above.
+        ensure_column(&conn, "decisions", "model", "TEXT")?;
         Ok(())
     }
 
@@ -325,6 +350,44 @@ mod tests {
             .unwrap();
         let row = s.fetch_submission("run-1", 1, "argus-1-jito-1").unwrap().unwrap();
         assert_eq!(row.failure_class.as_deref(), Some("compute_exceeded"));
+    }
+
+    #[test]
+    fn ensure_column_upgrades_an_old_db_and_is_idempotent() {
+        // Simulate a pre-`model` argus.db: a decisions table created before the column
+        // existed (8 columns, no `model`) — exactly what CREATE TABLE IF NOT EXISTS skips.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE decisions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          TEXT    NOT NULL,
+                attempt         INTEGER NOT NULL,
+                failure_class   TEXT    NOT NULL,
+                remedy          TEXT    NOT NULL,
+                rationale       TEXT    NOT NULL,
+                confidence      REAL,
+                reasoning_trace TEXT,
+                decided_at      INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // The guard adds the missing column...
+        ensure_column(&conn, "decisions", "model", "TEXT").unwrap();
+        // ...so the full 9-column INSERT (the one record_decision uses) now succeeds.
+        conn.execute(
+            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, rationale, confidence, reasoning_trace, model, decided_at)
+             VALUES ('run-old', 1, 'expired_blockhash', 'refresh_blockhash', 'x', 1.0, NULL, 'local', 7)",
+            [],
+        )
+        .unwrap();
+        // Running it again is a no-op, not an error (idempotent — safe on every startup).
+        ensure_column(&conn, "decisions", "model", "TEXT").unwrap();
+
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM decisions WHERE run_id = 'run-old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("local"), "the upgraded column round-trips");
     }
 
     #[test]

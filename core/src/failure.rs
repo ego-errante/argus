@@ -33,6 +33,13 @@ pub const MAX_CU_LIMIT: u32 = 1_400_000;
 const TIP_BUMP_NUMERATOR: u64 = 3; // 1.5x
 const TIP_BUMP_DENOMINATOR: u64 = 2;
 
+/// Provenance markers for the `Decision.model` field on the two local paths (ADR 0006).
+/// Single source of truth — the ADR 0006 trace-provenance filter keys on these exact
+/// strings, so a stray typo in a literal would silently break it. `model` stays free
+/// text (it also holds real OpenRouter slugs), so these are consts, not an enum.
+pub const MODEL_LOCAL: &str = "local";
+pub const MODEL_LOCAL_FALLBACK: &str = "local-fallback";
+
 /// A deterministic fault to inject. Mirrors the three deterministic `FailureClass`
 /// causes; `FeeTooLow` is probabilistic (landing-contention) and not injectable here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,16 +220,28 @@ impl Policy {
     }
 }
 
+/// Shared shape of the two local (non-Agent) Decisions: the class's default remedy,
+/// full confidence, NO Reasoning Trace (so the ADR 0006 provenance check excludes them
+/// from scored evidence), and a `model` provenance marker. The caller supplies the
+/// marker + rationale — the only things that differ between the stand-in and the fallback.
+fn local_like(class: FailureClass, model: &str, rationale: String) -> Decision {
+    Decision {
+        remedy: default_remedy(class),
+        rationale,
+        confidence: 1.0,
+        reasoning_trace: None,
+        model: Some(model.to_string()),
+    }
+}
+
 /// The local policy's decision (pure — the testable core of `Policy::Local`).
 fn local_decision(class: FailureClass) -> Decision {
     let remedy = default_remedy(class);
-    Decision {
-        remedy,
-        rationale: format!("local default policy: {class:?} -> {remedy:?} (Agent stand-in, ADR 0003)"),
-        confidence: 1.0,
-        reasoning_trace: None,
-        model: Some("local".to_string()),
-    }
+    local_like(
+        class,
+        MODEL_LOCAL,
+        format!("local default policy: {class:?} -> {remedy:?} (Agent stand-in, ADR 0003)"),
+    )
 }
 
 /// The decision used when the Agent path errors (Q3): the local default remedy, marked
@@ -230,19 +249,18 @@ fn local_decision(class: FailureClass) -> Decision {
 /// Trace, so the ADR 0006 trace-provenance check naturally excludes it from scored evidence.
 fn fallback_decision(class: FailureClass, err: &str) -> Decision {
     let remedy = default_remedy(class);
-    Decision {
-        remedy,
-        rationale: format!("agent unreachable ({err}); local fallback: {class:?} -> {remedy:?}"),
-        confidence: 1.0,
-        reasoning_trace: None,
-        model: Some("local-fallback".to_string()),
-    }
+    local_like(
+        class,
+        MODEL_LOCAL_FALLBACK,
+        format!("agent unreachable ({err}); local fallback: {class:?} -> {remedy:?}"),
+    )
 }
 
-/// True when a Reasoning Trace is absent or blank. On the Agent path an empty trace is
-/// the ADR 0006 evidence gap to warn on (the decision is kept, but it's weak evidence).
-pub fn trace_is_empty(trace: Option<&str>) -> bool {
-    trace.map(str::trim).is_none_or(str::is_empty)
+/// True when an optional string field is absent or blank (only whitespace). On the Agent
+/// path it flags the ADR 0006 evidence gaps to warn on — an empty Reasoning Trace or an
+/// empty `model` slug (the decision is kept, but that provenance is weak).
+pub fn is_blank(s: Option<&str>) -> bool {
+    s.map(str::trim).is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -394,7 +412,7 @@ mod tests {
             assert_eq!(d.remedy, default_remedy(class));
             assert_eq!(d.confidence, 1.0);
             assert!(d.reasoning_trace.is_none(), "the local stand-in has no Reasoning Trace");
-            assert_eq!(d.model.as_deref(), Some("local"), "local policy is marked 'local'");
+            assert_eq!(d.model.as_deref(), Some(MODEL_LOCAL), "local policy is marked 'local'");
         }
     }
 
@@ -404,16 +422,17 @@ mod tests {
         // 'local-fallback' with no trace so it's excluded from scored evidence (ADR 0006).
         let d = fallback_decision(FailureClass::ComputeExceeded, "connection refused");
         assert_eq!(d.remedy, default_remedy(FailureClass::ComputeExceeded));
-        assert_eq!(d.model.as_deref(), Some("local-fallback"));
+        assert_eq!(d.model.as_deref(), Some(MODEL_LOCAL_FALLBACK));
         assert!(d.reasoning_trace.is_none(), "a fallback carries no Reasoning Trace");
         assert!(d.rationale.contains("connection refused"), "the cause is recorded in the rationale");
     }
 
     #[test]
-    fn trace_is_empty_treats_blank_as_empty() {
-        assert!(trace_is_empty(None), "absent -> empty");
-        assert!(trace_is_empty(Some("")), "empty string -> empty");
-        assert!(trace_is_empty(Some("   \n\t")), "whitespace -> empty");
-        assert!(!trace_is_empty(Some("I chose refresh because ...")), "real reasoning -> not empty");
+    fn is_blank_treats_absent_and_whitespace_as_blank() {
+        assert!(is_blank(None), "absent -> blank");
+        assert!(is_blank(Some("")), "empty string -> blank");
+        assert!(is_blank(Some("   \n\t")), "whitespace -> blank");
+        assert!(!is_blank(Some("I chose refresh because ...")), "real reasoning -> not blank");
+        assert!(!is_blank(Some("anthropic/claude-sonnet-4.6")), "a real model slug -> not blank");
     }
 }

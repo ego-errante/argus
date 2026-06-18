@@ -25,12 +25,14 @@ export const FailureContextSchema = z.object({
   attempt: z.number().int(),
   error_text: z.string(),
   tip_lamports: z.number().int(),
-  tip_floor_p50: z.number().int(),
-  tip_floor_p75: z.number().int(),
+  // Honestly optional: a `null` means the Core couldn't fetch it (not a fabricated
+  // 0/base). Matches the Rust FailureContext's Option<u64> for these fields.
+  tip_floor_p50: z.number().int().nullable().optional(),
+  tip_floor_p75: z.number().int().nullable().optional(),
   blockhash_age_slots: z.number().int().nullable().optional(),
   cu_limit: z.number().int().nullable().optional(),
   cu_used: z.number().int().nullable().optional(),
-  current_slot: z.number().int(),
+  current_slot: z.number().int().nullable().optional(),
 });
 export type FailureContext = z.infer<typeof FailureContextSchema>;
 

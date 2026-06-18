@@ -418,7 +418,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
             failure::Policy::Agent(agent_client::AgentClient::new(
                 &cfg.agent_url,
                 cfg.agent_timeout_secs,
-            ))
+            )?)
         } else {
             info!("POLICY: local default policy (Agent stand-in) — set ARGUS_POLICY=agent for the AI Agent");
             failure::Policy::Local
@@ -773,9 +773,12 @@ async fn injection_run(
         tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 75),
         rpc::get_slot(&cfg.rpc_http_url),
     );
-    let tip_floor_p50 = tip_floor_p50.unwrap_or(base_tip);
-    let tip_floor_p75 = tip_floor_p75.unwrap_or(base_tip);
-    let current_slot = current_slot.unwrap_or(0);
+    // The Agent gets honest Options (a fetch failure is `None`, not a fabricated 0/base it
+    // can't distinguish from a real value). `apply_remedy`'s BumpTip math still needs a
+    // concrete floor, so keep a separate `bump_floor` that falls back to base_tip locally.
+    let (tip_floor_p50, tip_floor_p75, current_slot) =
+        (tip_floor_p50.ok(), tip_floor_p75.ok(), current_slot.ok());
+    let bump_floor = tip_floor_p75.unwrap_or(base_tip);
     let ctx = agent_client::FailureContext {
         failure_class: class,
         attempt: attempt as u32,
@@ -794,9 +797,17 @@ async fn injection_run(
     // loudly if it came back empty (provider hiccup / non-reasoning fallback model) so the
     // gap is caught live during the Run, not at Lifecycle-Log assembly. The decision is
     // still valid and kept — only the visible-reasoning evidence is weak.
-    if cfg.use_agent && failure::trace_is_empty(decision.reasoning_trace.as_deref()) {
-        warn!(model = ?decision.model, ?class, remedy = ?decision.remedy,
-            "INJECT: agent decision recorded with EMPTY reasoning trace — weak scored evidence (ADR 0006)");
+    if cfg.use_agent {
+        if failure::is_blank(decision.reasoning_trace.as_deref()) {
+            warn!(model = ?decision.model, ?class, remedy = ?decision.remedy,
+                "INJECT: agent decision recorded with EMPTY reasoning trace — weak scored evidence (ADR 0006)");
+        }
+        // A blank model slug breaks the ADR 0006 provenance filter (it can't be tied to a
+        // reasoning-capable model), so warn at decision time too — same evidence-gap class.
+        if failure::is_blank(decision.model.as_deref()) {
+            warn!(?class, remedy = ?decision.remedy,
+                "INJECT: agent decision recorded with EMPTY model slug — provenance gap (ADR 0006)");
+        }
     }
     store.record_decision(
         run_id,
@@ -829,8 +840,13 @@ async fn injection_run(
     } else {
         None
     };
-    let state = RetryState { tip_lamports: base_tip, cu_limit, priority_fee_microlamports: None };
-    let (next, cont) = failure::apply_remedy(decision.remedy, state, tip_floor_p75, cu_used);
+    // Seed attempt-2 CLEAN: the injected attempt-1 `cu_limit` (Some(1) for ComputeExceeded)
+    // is attempt-1-only — carrying it forward would make any non-RaiseCuLimit remedy rebuild
+    // with cu_limit=1 and re-fail. RaiseCuLimit derives its real limit from `cu_used` (the
+    // max-CU re-sim), so the happy path is unchanged; the Agent still sees the failing limit
+    // via FailureContext.cu_limit above. Only the retry seed is reset.
+    let state = RetryState { tip_lamports: base_tip, cu_limit: None, priority_fee_microlamports: None };
+    let (next, cont) = failure::apply_remedy(decision.remedy, state, bump_floor, cu_used);
     if !cont {
         warn!(?class, remedy = ?decision.remedy, "INJECT: Remedy = Abort — not retrying (Failure recorded, no landing)");
         if let Some(row) = store.fetch_submission(run_id, attempt, &nonce)? {
