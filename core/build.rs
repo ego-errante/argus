@@ -3,12 +3,14 @@
 
 fn main() {
     // Reproducible protoc via a vendored binary — no system protoc needed, so the
-    // docker build stays a plain `rust:slim` with no apt-get. (build scripts run in
-    // process isolation, so we set PROTOC here even though yellowstone sets its own.)
-    std::env::set_var(
-        "PROTOC",
-        protoc_bin_vendored::protoc_bin_path().expect("vendored protoc binary"),
-    );
+    // docker build stays a plain `rust:slim` with no apt-get. Only set it when the
+    // operator/CI hasn't deliberately exported a PROTOC of their own.
+    if std::env::var_os("PROTOC").is_none() {
+        std::env::set_var(
+            "PROTOC",
+            protoc_bin_vendored::protoc_bin_path().expect("vendored protoc binary"),
+        );
+    }
 
     tonic_prost_build::configure()
         .build_server(false) // client-only — we never serve this RPC

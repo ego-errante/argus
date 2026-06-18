@@ -48,22 +48,52 @@ fn get(key: &str, missing: &mut Vec<String>) -> String {
     }
 }
 
-/// Parse a numeric env var, falling back to `default` when unset or unparseable.
+/// Parse a numeric env var, falling back to `default`. Warns when the var is SET
+/// but unparseable, so a typo'd override is never silently ignored.
 fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<T>() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(key, value = %raw, "ignoring unparseable env var — using default");
+                default
+            }
+        },
+    }
 }
 
-/// The Jito Tip Floor only publishes 25/50/75/95/99th percentiles; anything else
-/// has no field to read. Default 75 (landing-biased); warn + fall back on a bad value.
-const SUPPORTED_TIP_PERCENTILES: [u8; 5] = [25, 50, 75, 95, 99];
+/// Like `env_num` but additionally rejects `0` (warns + uses default). For values
+/// where 0 is a misconfig (e.g. a 0-CU compute limit yields an on-chain-failing tx).
+fn env_num_positive<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+{
+    let zero = T::from(0u8);
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<T>() {
+            Ok(v) if v != zero => v,
+            Ok(_) => {
+                tracing::warn!(key, "value must be > 0 — using default");
+                default
+            }
+            Err(_) => {
+                tracing::warn!(key, value = %raw, "ignoring unparseable env var — using default");
+                default
+            }
+        },
+    }
+}
+
+/// The Jito Tip Floor only publishes the percentiles in `tip::SUPPORTED_TIP_PERCENTILES`
+/// (single source of truth); anything else has no field to read. Default 75
+/// (landing-biased); warn + fall back on a bad value.
 fn parse_tip_percentile(raw: Option<String>) -> u8 {
     match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => 75,
         Some(s) => match s.parse::<u8>() {
-            Ok(p) if SUPPORTED_TIP_PERCENTILES.contains(&p) => p,
+            Ok(p) if crate::tip::SUPPORTED_TIP_PERCENTILES.contains(&p) => p,
             _ => {
                 tracing::warn!(
                     value = s,
@@ -101,18 +131,21 @@ impl Config {
             helius_swqos_only: std::env::var("HELIUS_SWQOS_ONLY")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
-            sender_dual_min_tip_lamports: env_num(
+            sender_dual_min_tip_lamports: env_num_positive(
                 "SENDER_DUAL_MIN_TIP_LAMPORTS",
                 crate::sender::DUAL_MIN_TIP_LAMPORTS,
             ),
-            sender_swqos_min_tip_lamports: env_num(
+            sender_swqos_min_tip_lamports: env_num_positive(
                 "SENDER_SWQOS_MIN_TIP_LAMPORTS",
                 crate::sender::SWQOS_MIN_TIP_LAMPORTS,
             ),
-            sender_compute_unit_limit: env_num("SENDER_COMPUTE_UNIT_LIMIT", 20_000u32),
-            sender_priority_fee_microlamports: env_num(
+            sender_compute_unit_limit: env_num_positive(
+                "SENDER_COMPUTE_UNIT_LIMIT",
+                crate::sender::COMPUTE_UNIT_LIMIT,
+            ),
+            sender_priority_fee_microlamports: env_num_positive(
                 "SENDER_PRIORITY_FEE_MICROLAMPORTS",
-                100_000u64,
+                crate::sender::PRIORITY_FEE_MICROLAMPORTS,
             ),
             keypair_path: std::env::var("KEYPAIR_PATH")
                 .unwrap_or_else(|_| "./secrets/keypair.json".into()),
@@ -137,9 +170,23 @@ mod tests {
 
     #[test]
     fn tip_percentile_accepts_supported_values() {
-        for p in SUPPORTED_TIP_PERCENTILES {
+        for p in crate::tip::SUPPORTED_TIP_PERCENTILES {
             assert_eq!(parse_tip_percentile(Some(p.to_string())), p);
         }
+    }
+
+    #[test]
+    fn env_num_positive_rejects_zero_and_bad_input() {
+        // Unset -> default; set-but-zero -> default; set-but-garbage -> default.
+        std::env::remove_var("ARGUS_TEST_NUM");
+        assert_eq!(env_num_positive("ARGUS_TEST_NUM", 20_000u32), 20_000);
+        std::env::set_var("ARGUS_TEST_NUM", "0");
+        assert_eq!(env_num_positive("ARGUS_TEST_NUM", 20_000u32), 20_000, "0 rejected");
+        std::env::set_var("ARGUS_TEST_NUM", "2O000"); // letter O typo
+        assert_eq!(env_num_positive("ARGUS_TEST_NUM", 20_000u32), 20_000, "garbage rejected");
+        std::env::set_var("ARGUS_TEST_NUM", "30000");
+        assert_eq!(env_num_positive("ARGUS_TEST_NUM", 20_000u32), 30_000, "valid override applied");
+        std::env::remove_var("ARGUS_TEST_NUM");
     }
 
     #[test]

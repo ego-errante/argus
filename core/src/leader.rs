@@ -6,17 +6,20 @@
 //! submission"). This method is gRPC-ONLY — it is not on Jito's HTTP JSON-RPC API
 //! (verified against jito-labs/mev-protos) — and is served NoAuth for read calls.
 //!
-//! This is an OPTIMIZATION signal, never a gate: a failed/empty response logs a
-//! warning and the caller submits anyway. The authoritative current-slot signal in
-//! the full lifecycle is the Yellowstone slot stream (Day 3-4).
+//! This is an OPTIMIZATION signal, never a gate: a failed/empty/timed-out response
+//! logs a warning and the caller submits anyway. The authoritative current-slot
+//! signal in the full lifecycle is the Yellowstone slot stream (Day 3-4).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 /// Bound the connect so a flaky/throttled searcher endpoint fails fast and the
 /// caller proceeds to submit without timing, rather than stalling the window.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound the unary RPC itself — connect_timeout only covers establishing the
+/// channel; a connected-but-hung endpoint must not stall the submission loop.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Generated client + messages for the minimal `searcher.proto` (see build.rs).
 pub mod searcher_proto {
@@ -55,22 +58,21 @@ pub fn next_leader_from_proto(r: &NextScheduledLeaderResponse) -> NextLeader {
     }
 }
 
-/// Normalize a gRPC endpoint to a full URI, defaulting to `https://` when no
-/// scheme is present (mirrors `streaming::grpc_builder`'s scheme handling).
-fn searcher_endpoint_uri(raw: &str) -> String {
-    if raw.contains("://") {
-        raw.to_string()
-    } else {
-        format!("https://{raw}")
-    }
+/// A response is usable only if it names a real leader slot. proto3 zero-defaults
+/// an absent/empty response to all-zeros; treat that as "no signal" (the caller
+/// then submits without timing) rather than a fabricated zero-gap window.
+fn is_valid_leader(nl: &NextLeader) -> bool {
+    nl.current_slot != 0 && nl.next_leader_slot != 0
 }
 
 /// Connect a `SearcherServiceClient` over TLS (https) or plaintext (http). Reuses
 /// the process-wide ring `CryptoProvider` installed in `main.rs`; native roots come
 /// from the OS trust store (the Dockerfile installs `ca-certificates`).
 async fn connect_searcher(grpc_endpoint: &str) -> Result<SearcherServiceClient<Channel>> {
-    let mut endpoint =
-        Endpoint::from_shared(searcher_endpoint_uri(grpc_endpoint))?.connect_timeout(CONNECT_TIMEOUT);
+    // Scheme handling is shared with the Yellowstone client (one rule, one place).
+    // An explicit `http://` keeps plaintext gRPC (local dev); https/bare-host -> TLS.
+    let mut endpoint = Endpoint::from_shared(crate::streaming::normalize_grpc_endpoint(grpc_endpoint))?
+        .connect_timeout(CONNECT_TIMEOUT);
     if endpoint.uri().scheme_str() == Some("https") {
         endpoint = endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?;
     }
@@ -80,15 +82,26 @@ async fn connect_searcher(grpc_endpoint: &str) -> Result<SearcherServiceClient<C
 
 /// Query Jito's SearcherService over gRPC (NoAuth) for the next scheduled Jito
 /// leader. `regions` may be empty (defaults to the connected region). Optimization
-/// signal only — the caller treats `Err` as "submit without leader timing".
+/// signal only — the caller treats `Err` (incl. timeout / empty response) as
+/// "submit without leader timing".
 pub async fn next_scheduled_leader(grpc_endpoint: &str, regions: &[String]) -> Result<NextLeader> {
     let mut client = connect_searcher(grpc_endpoint).await?;
-    let resp = client
-        .get_next_scheduled_leader(NextScheduledLeaderRequest {
+    let resp = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        client.get_next_scheduled_leader(NextScheduledLeaderRequest {
             regions: regions.to_vec(),
-        })
-        .await?;
-    Ok(next_leader_from_proto(resp.get_ref()))
+        }),
+    )
+    .await
+    .map_err(|_| anyhow!("getNextScheduledLeader timed out after {REQUEST_TIMEOUT:?}"))??;
+
+    let nl = next_leader_from_proto(resp.get_ref());
+    if !is_valid_leader(&nl) {
+        return Err(anyhow!(
+            "empty getNextScheduledLeader response (no scheduled leader / partial proto)"
+        ));
+    }
+    Ok(nl)
 }
 
 #[cfg(test)]
@@ -134,16 +147,21 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_uri_defaults_scheme_to_https() {
-        assert_eq!(
-            searcher_endpoint_uri("frankfurt.mainnet.block-engine.jito.wtf"),
-            "https://frankfurt.mainnet.block-engine.jito.wtf"
-        );
-        // An explicit scheme is left untouched (plaintext gRPC stays http).
-        assert_eq!(searcher_endpoint_uri("http://localhost:1003"), "http://localhost:1003");
-        assert_eq!(
-            searcher_endpoint_uri("https://frankfurt.mainnet.block-engine.jito.wtf"),
-            "https://frankfurt.mainnet.block-engine.jito.wtf"
-        );
+    fn rejects_empty_proto_as_no_signal() {
+        // proto3 zero-default: an absent/empty response decodes to all-zeros.
+        let zero = NextLeader {
+            current_slot: 0,
+            next_leader_slot: 0,
+            next_leader_identity: String::new(),
+            next_leader_region: String::new(),
+        };
+        assert!(!is_valid_leader(&zero), "all-zero proto is no-signal, not a 0-gap window");
+        let ok = NextLeader {
+            current_slot: 100,
+            next_leader_slot: 104,
+            next_leader_identity: "id".into(),
+            next_leader_region: "ny".into(),
+        };
+        assert!(is_valid_leader(&ok));
     }
 }

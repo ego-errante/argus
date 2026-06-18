@@ -119,15 +119,22 @@ pub async fn subscribe_slots(
     Ok(())
 }
 
-/// Build a client builder for a Yellowstone endpoint. SolInfra (and most managed
-/// Yellowstone) hands out a bare host[:port]; tonic's URI parser needs a scheme, so
-/// default to TLS (https) when none is supplied.
-fn grpc_builder(grpc_url: &str, x_token: Option<&str>) -> Result<GeyserGrpcBuilder> {
-    let endpoint = if grpc_url.contains("://") {
-        grpc_url.to_string()
+/// Normalize a gRPC endpoint to a full URI: managed gRPC (SolInfra/Yellowstone,
+/// Jito searcher) hands out a bare host[:port], but tonic's URI parser needs a
+/// scheme, so default to TLS (https) when none is supplied. An explicit scheme
+/// (incl. `http://` for plaintext gRPC) is left untouched. Shared by both gRPC
+/// clients (this builder and `leader::connect_searcher`) so the rule lives once.
+pub(crate) fn normalize_grpc_endpoint(raw: &str) -> String {
+    if raw.contains("://") {
+        raw.to_string()
     } else {
-        format!("https://{grpc_url}")
-    };
+        format!("https://{raw}")
+    }
+}
+
+/// Build a client builder for a Yellowstone endpoint.
+fn grpc_builder(grpc_url: &str, x_token: Option<&str>) -> Result<GeyserGrpcBuilder> {
+    let endpoint = normalize_grpc_endpoint(grpc_url);
     let mut builder = GeyserGrpcClient::build_from_shared(endpoint.clone())?;
     if let Some(token) = x_token {
         builder = builder.x_token(Some(token))?;
@@ -236,6 +243,20 @@ pub async fn track_lifecycle(
 mod tests {
     use super::*;
     use yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo;
+
+    #[test]
+    fn normalize_grpc_endpoint_defaults_scheme_to_https() {
+        // Bare host (SolInfra/Jito searcher style) -> https; explicit scheme kept.
+        assert_eq!(
+            normalize_grpc_endpoint("frankfurt.mainnet.block-engine.jito.wtf"),
+            "https://frankfurt.mainnet.block-engine.jito.wtf"
+        );
+        assert_eq!(normalize_grpc_endpoint("http://localhost:1003"), "http://localhost:1003");
+        assert_eq!(
+            normalize_grpc_endpoint("https://fra.grpc.solinfra.dev:443"),
+            "https://fra.grpc.solinfra.dev:443"
+        );
+    }
 
     #[test]
     fn maps_the_three_commitment_statuses() {

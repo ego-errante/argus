@@ -15,9 +15,6 @@ service SearcherService {
   // regions (empty = the connected region). NoAuth read call.
   rpc GetNextScheduledLeader(NextScheduledLeaderRequest)
       returns (NextScheduledLeaderResponse);
-
-  // Block Engine regions (useful diagnostic cross-check of our region list).
-  rpc GetRegions(GetRegionsRequest) returns (GetRegionsResponse);
 }
 
 message NextScheduledLeaderRequest {
@@ -30,11 +27,4 @@ message NextScheduledLeaderResponse {
   uint64 next_leader_slot     = 2;
   string next_leader_identity = 3; // base58 pubkey
   string next_leader_region   = 4;
-}
-
-message GetRegionsRequest {}
-
-message GetRegionsResponse {
-  string current_region            = 1;
-  repeated string available_regions = 2;
 }

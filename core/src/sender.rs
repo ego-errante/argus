@@ -31,6 +31,11 @@ const TIP_ACCOUNTS: [&str; 10] = [
 pub const DUAL_MIN_TIP_LAMPORTS: u64 = 200_000; // 0.0002 SOL (staked + Jito)
 pub const SWQOS_MIN_TIP_LAMPORTS: u64 = 5_000; //   0.000005 SOL (staked only)
 
+/// Sender mandates a compute budget on its single-tx path; these are the DEFAULTS
+/// the config falls back to (`SENDER_COMPUTE_UNIT_LIMIT` / `SENDER_PRIORITY_FEE_MICROLAMPORTS`).
+pub const COMPUTE_UNIT_LIMIT: u32 = 20_000;
+pub const PRIORITY_FEE_MICROLAMPORTS: u64 = 100_000;
+
 /// A Sender tip account, rotated by `i`.
 pub fn tip_account(i: usize) -> Pubkey {
     Pubkey::from_str(TIP_ACCOUNTS[i % TIP_ACCOUNTS.len()]).expect("valid sender tip account")

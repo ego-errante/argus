@@ -162,6 +162,23 @@ pub fn regional_endpoints() -> Vec<String> {
     JITO_REGIONS.iter().map(|s| s.to_string()).collect()
 }
 
+/// The lowercase region id for each fan-out endpoint (e.g. "frankfurt"), DERIVED
+/// from `JITO_REGIONS` so the two can't drift. Passed to `getNextScheduledLeader`
+/// so the leader-window signal covers exactly the regions we submit to (not just
+/// the searcher's single connected region).
+pub fn region_names() -> Vec<String> {
+    JITO_REGIONS
+        .iter()
+        .map(|url| {
+            url.trim_start_matches("https://")
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
 /// The published Tip Accounts as Pubkeys — no network call (ADR 0005 constants).
 pub fn published_tip_accounts() -> Vec<Pubkey> {
     TIP_ACCOUNTS
@@ -315,6 +332,16 @@ pub async fn await_landed(
 mod tests {
     use super::*;
     use solana_sdk::message::Message;
+
+    #[test]
+    fn region_names_derive_from_endpoints() {
+        let names = region_names();
+        assert_eq!(names.len(), JITO_REGIONS.len());
+        assert_eq!(names[0], "amsterdam");
+        assert!(names.contains(&"frankfurt".to_string()));
+        // No scheme/host leakage in the derived ids.
+        assert!(names.iter().all(|n| !n.is_empty() && !n.contains('.') && !n.contains('/')));
+    }
 
     fn fixture(payer: &Keypair) -> BundleParams<'_> {
         BundleParams {

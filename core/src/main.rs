@@ -103,9 +103,10 @@ async fn main() -> Result<()> {
     let mut landed = false;
     for attempt in 1..=SUBMIT_ATTEMPTS {
         // Leader-window detection over gRPC (optimization signal — never blocks
-        // submission; empty regions = the connected region). NoAuth, so `auth` is
-        // not consumed here but stays in scope for the bundle fan-out below.
-        match leader::next_scheduled_leader(&cfg.jito_searcher_grpc_url, &[]).await {
+        // submission). We pass the SAME regions we fan out to, so the next-leader
+        // signal covers every region the bundle reaches. NoAuth, so `auth` is not
+        // consumed here but stays in scope for the bundle fan-out below.
+        match leader::next_scheduled_leader(&cfg.jito_searcher_grpc_url, &bundle::region_names()).await {
             Ok(nl) => {
                 let gap = nl.slots_until_leader();
                 info!(
@@ -117,7 +118,8 @@ async fn main() -> Result<()> {
                     "next Jito leader window"
                 );
                 if gap > NEAR_LEADER_SLOTS {
-                    let wait = (gap * SLOT_MS).min(MAX_WINDOW_WAIT_MS);
+                    // saturating_mul: `gap` is network-controlled; cap can't undo an overflow.
+                    let wait = gap.saturating_mul(SLOT_MS).min(MAX_WINDOW_WAIT_MS);
                     info!(attempt, wait_ms = wait, "aligning submission with leader window");
                     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                 }
@@ -291,7 +293,7 @@ async fn bundle_diagnostic(cfg: &config::Config) -> Result<()> {
 /// gRPC + the regional host) the same way ARGUS_STREAM proves the Yellowstone path.
 async fn leader_probe(cfg: &config::Config) -> Result<()> {
     info!(grpc = %cfg.jito_searcher_grpc_url, "LEADER: querying getNextScheduledLeader over gRPC (NoAuth)");
-    match leader::next_scheduled_leader(&cfg.jito_searcher_grpc_url, &[]).await {
+    match leader::next_scheduled_leader(&cfg.jito_searcher_grpc_url, &bundle::region_names()).await {
         Ok(nl) => info!(
             current_slot = nl.current_slot,
             next_leader_slot = nl.next_leader_slot,
