@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     rationale       TEXT    NOT NULL,
     confidence      REAL,
     reasoning_trace TEXT,                      -- summarized thinking — the visible-reasoning evidence
+    model           TEXT,                      -- serving model: real OpenRouter slug | local | local-fallback (ADR 0006 provenance)
     decided_at      INTEGER NOT NULL
 );
 

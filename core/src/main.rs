@@ -409,8 +409,22 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
     let tip_accounts = bundle::published_tip_accounts();
 
     if let Some(injection) = cfg.injection {
+        // Construct the decision Policy ONCE (only on the injection path — the clean
+        // path never decides). ARGUS_POLICY=agent swaps in the HTTP Agent with no other
+        // call-site change (the seam from ADR 0010); default stays the local stand-in.
+        let policy = if cfg.use_agent {
+            info!(agent_url = %cfg.agent_url, timeout_secs = cfg.agent_timeout_secs,
+                "POLICY: AI Agent over HTTP (ARGUS_POLICY=agent)");
+            failure::Policy::Agent(agent_client::AgentClient::new(
+                &cfg.agent_url,
+                cfg.agent_timeout_secs,
+            ))
+        } else {
+            info!("POLICY: local default policy (Agent stand-in) — set ARGUS_POLICY=agent for the AI Agent");
+            failure::Policy::Local
+        };
         return injection_run(
-            cfg, store, &payer, &run_id, base_tip, &regions, auth, &tip_accounts, injection,
+            cfg, store, &payer, &run_id, base_tip, &regions, auth, &tip_accounts, injection, &policy,
         )
         .await;
     }
@@ -689,8 +703,9 @@ async fn injection_run(
     auth: Option<&str>,
     tip_accounts: &[solana_sdk::pubkey::Pubkey],
     injection: failure::Injection,
+    policy: &failure::Policy,
 ) -> Result<()> {
-    use failure::{Injection, Policy, RetryState};
+    use failure::{Injection, RetryState};
     use solana_sdk::signer::Signer;
 
     let attempt: i64 = 1;
@@ -749,9 +764,10 @@ async fn injection_run(
     let err_text = sim.err.clone().unwrap_or_default();
     warn!(?injection, ?class, err = %err_text, instruction_error = ?sim.instruction_error, units_consumed = ?sim.units_consumed, "INJECT: classified Failure");
 
-    // 3) Decide a Remedy (local policy stands in for the Agent until Day 9-10). These
-    // three fetches populate the FailureContext for the Day 9-10 Agent (the Local policy
-    // reads only failure_class); run them concurrently so they're off the serial path.
+    // 3) Decide a Remedy via the selected Policy (the AI Agent over HTTP when
+    // ARGUS_POLICY=agent, else the local stand-in). These three fetches populate the
+    // FailureContext the Agent reasons over (the Local policy reads only failure_class);
+    // run them concurrently so they're off the serial path.
     let (tip_floor_p50, tip_floor_p75, current_slot) = tokio::join!(
         tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 50),
         tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 75),
@@ -773,7 +789,15 @@ async fn injection_run(
         cu_used: sim.units_consumed,
         current_slot,
     };
-    let decision = Policy::Local.decide(&ctx).await?;
+    let decision = policy.decide(&ctx).await?;
+    // ADR 0006: a scored decision must carry a Reasoning Trace. On the Agent path, warn
+    // loudly if it came back empty (provider hiccup / non-reasoning fallback model) so the
+    // gap is caught live during the Run, not at Lifecycle-Log assembly. The decision is
+    // still valid and kept — only the visible-reasoning evidence is weak.
+    if cfg.use_agent && failure::trace_is_empty(decision.reasoning_trace.as_deref()) {
+        warn!(model = ?decision.model, ?class, remedy = ?decision.remedy,
+            "INJECT: agent decision recorded with EMPTY reasoning trace — weak scored evidence (ADR 0006)");
+    }
     store.record_decision(
         run_id,
         attempt,
@@ -782,9 +806,10 @@ async fn injection_run(
         &decision.rationale,
         Some(decision.confidence),
         decision.reasoning_trace.as_deref(),
+        decision.model.as_deref(),
         now_millis() as i64,
     )?;
-    info!(?class, remedy = ?decision.remedy, rationale = %decision.rationale, "INJECT: Remedy chosen");
+    info!(?class, remedy = ?decision.remedy, model = ?decision.model, confidence = decision.confidence, rationale = %decision.rationale, "INJECT: Remedy chosen");
 
     // 4) Execute the Remedy hook: next-attempt state, or stop on Abort. For a compute
     // remedy, observe the TRUE CU need from a max-CU re-simulation of the clean attempt-2

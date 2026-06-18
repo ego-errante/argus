@@ -222,11 +222,12 @@ impl Store {
         rationale: &str,
         confidence: Option<f64>,
         reasoning_trace: Option<&str>,
+        model: Option<&str>,
         decided_at: i64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, rationale, confidence, reasoning_trace, decided_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, rationale, confidence, reasoning_trace, model, decided_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 run_id,
                 attempt,
@@ -235,6 +236,7 @@ impl Store {
                 rationale,
                 confidence,
                 reasoning_trace,
+                model,
                 decided_at
             ],
         )?;
@@ -336,20 +338,22 @@ mod tests {
             "local default policy",
             Some(1.0),
             None,
+            Some("anthropic/claude-sonnet-4.6"),
             42,
         )
         .unwrap();
         // The test lives in the storage module, so it can read the private conn.
         let conn = s.conn.lock().unwrap();
-        let (class, remedy, decided): (String, String, i64) = conn
+        let (class, remedy, model, decided): (String, String, Option<String>, i64) = conn
             .query_row(
-                "SELECT failure_class, remedy, decided_at FROM decisions WHERE run_id = ?1 AND attempt = ?2",
+                "SELECT failure_class, remedy, model, decided_at FROM decisions WHERE run_id = ?1 AND attempt = ?2",
                 params!["run-1", 1],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(class, "expired_blockhash");
         assert_eq!(remedy, "refresh_blockhash");
+        assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.6"), "the serving model persists (ADR 0006)");
         assert_eq!(decided, 42);
     }
 }

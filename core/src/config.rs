@@ -41,6 +41,13 @@ pub struct Config {
     pub injection: Option<crate::failure::Injection>,
     pub keypair_path: String,
     pub agent_url: String,
+    /// Decision source for injected Failures (ARGUS_POLICY, ADR 0006/0010). `true` =
+    /// the AI Agent over HTTP; `false` (default) = the local default policy stand-in.
+    /// Explicit because `agent_url` always has a default, so its presence can't select.
+    pub use_agent: bool,
+    /// Bound on the Agent decide round-trip (ARGUS_AGENT_TIMEOUT_SECS). Generous by
+    /// default — a reasoning completion is slow; a dead Agent trips this into a fallback.
+    pub agent_timeout_secs: u64,
     pub db_path: String,
 }
 
@@ -90,6 +97,16 @@ where
             }
         },
     }
+}
+
+/// Parse `ARGUS_POLICY`: `"agent"` selects the AI Agent as the decision source;
+/// anything else (unset, `"local"`, garbage) stays on the local default policy. Default
+/// local keeps every existing test and the clean path unchanged until the Agent is opted in.
+fn parse_use_agent(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("agent")
+    )
 }
 
 /// The Jito Tip Floor only publishes the percentiles in `tip::SUPPORTED_TIP_PERCENTILES`
@@ -168,6 +185,8 @@ impl Config {
                 .unwrap_or_else(|_| "./secrets/keypair.json".into()),
             agent_url: std::env::var("AGENT_URL")
                 .unwrap_or_else(|_| "http://localhost:8787/decide".into()),
+            use_agent: parse_use_agent(std::env::var("ARGUS_POLICY").ok().as_deref()),
+            agent_timeout_secs: env_num_positive("ARGUS_AGENT_TIMEOUT_SECS", 45u64),
             db_path: std::env::var("ARGUS_DB_PATH").unwrap_or_else(|_| "logs/argus.db".into()),
         };
 
@@ -204,6 +223,16 @@ mod tests {
         std::env::set_var("ARGUS_TEST_NUM", "30000");
         assert_eq!(env_num_positive("ARGUS_TEST_NUM", 20_000u32), 30_000, "valid override applied");
         std::env::remove_var("ARGUS_TEST_NUM");
+    }
+
+    #[test]
+    fn use_agent_only_on_explicit_agent() {
+        assert!(parse_use_agent(Some("agent")), "explicit agent selects the Agent");
+        assert!(parse_use_agent(Some("  AGENT ")), "trimmed + case-insensitive");
+        assert!(!parse_use_agent(None), "unset -> local (default)");
+        assert!(!parse_use_agent(Some("local")), "explicit local -> local");
+        assert!(!parse_use_agent(Some("agentt")), "typo -> local, not Agent");
+        assert!(!parse_use_agent(Some("")), "blank -> local");
     }
 
     #[test]

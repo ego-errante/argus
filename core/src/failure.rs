@@ -13,6 +13,7 @@ use crate::rpc::SimResult;
 use anyhow::Result;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
+use tracing::warn;
 
 /// How far back to age the injected blockhash. Blockhashes are valid ~150 slots, so
 /// 200 is reliably expired while still being a genuinely real, recent cluster hash.
@@ -194,10 +195,20 @@ pub enum Policy {
 }
 
 impl Policy {
+    /// Decide a Remedy. The Agent arm NEVER propagates a transport error: on any
+    /// failure (unreachable, timeout, 5xx, bad body) it warns loudly and returns the
+    /// local fallback decision, marked `local-fallback`, so a transient Agent hiccup
+    /// can't kill an in-progress Run yet the provenance never lies (ADR 0006/0008).
     pub async fn decide(&self, ctx: &FailureContext<'_>) -> Result<Decision> {
         match self {
             Policy::Local => Ok(local_decision(ctx.failure_class)),
-            Policy::Agent(client) => client.decide(ctx).await,
+            Policy::Agent(client) => match client.decide(ctx).await {
+                Ok(d) => Ok(d),
+                Err(e) => {
+                    warn!(error = %e, "agent decide failed — falling back to local default policy (recorded)");
+                    Ok(fallback_decision(ctx.failure_class, &e.to_string()))
+                }
+            },
         }
     }
 }
@@ -210,7 +221,28 @@ fn local_decision(class: FailureClass) -> Decision {
         rationale: format!("local default policy: {class:?} -> {remedy:?} (Agent stand-in, ADR 0003)"),
         confidence: 1.0,
         reasoning_trace: None,
+        model: Some("local".to_string()),
     }
+}
+
+/// The decision used when the Agent path errors (Q3): the local default remedy, marked
+/// `local-fallback` with the cause in the rationale. A fallback row carries no Reasoning
+/// Trace, so the ADR 0006 trace-provenance check naturally excludes it from scored evidence.
+fn fallback_decision(class: FailureClass, err: &str) -> Decision {
+    let remedy = default_remedy(class);
+    Decision {
+        remedy,
+        rationale: format!("agent unreachable ({err}); local fallback: {class:?} -> {remedy:?}"),
+        confidence: 1.0,
+        reasoning_trace: None,
+        model: Some("local-fallback".to_string()),
+    }
+}
+
+/// True when a Reasoning Trace is absent or blank. On the Agent path an empty trace is
+/// the ADR 0006 evidence gap to warn on (the decision is kept, but it's weak evidence).
+pub fn trace_is_empty(trace: Option<&str>) -> bool {
+    trace.map(str::trim).is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -362,6 +394,26 @@ mod tests {
             assert_eq!(d.remedy, default_remedy(class));
             assert_eq!(d.confidence, 1.0);
             assert!(d.reasoning_trace.is_none(), "the local stand-in has no Reasoning Trace");
+            assert_eq!(d.model.as_deref(), Some("local"), "local policy is marked 'local'");
         }
+    }
+
+    #[test]
+    fn fallback_decision_uses_default_remedy_and_is_marked() {
+        // The Agent-unreachable fallback must still pick the right remedy, but be marked
+        // 'local-fallback' with no trace so it's excluded from scored evidence (ADR 0006).
+        let d = fallback_decision(FailureClass::ComputeExceeded, "connection refused");
+        assert_eq!(d.remedy, default_remedy(FailureClass::ComputeExceeded));
+        assert_eq!(d.model.as_deref(), Some("local-fallback"));
+        assert!(d.reasoning_trace.is_none(), "a fallback carries no Reasoning Trace");
+        assert!(d.rationale.contains("connection refused"), "the cause is recorded in the rationale");
+    }
+
+    #[test]
+    fn trace_is_empty_treats_blank_as_empty() {
+        assert!(trace_is_empty(None), "absent -> empty");
+        assert!(trace_is_empty(Some("")), "empty string -> empty");
+        assert!(trace_is_empty(Some("   \n\t")), "whitespace -> empty");
+        assert!(!trace_is_empty(Some("I chose refresh because ...")), "real reasoning -> not empty");
     }
 }

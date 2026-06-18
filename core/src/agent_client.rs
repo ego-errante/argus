@@ -29,6 +29,11 @@ pub struct Decision {
     pub confidence: f64,
     #[serde(default)]
     pub reasoning_trace: Option<String>,
+    /// The model that actually served the decision (post-fallback OpenRouter slug),
+    /// or a `local`/`local-fallback` marker for the local policy paths. Logged per
+    /// decision so the Run can confirm every scored decision carried a trace (ADR 0006).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 pub struct AgentClient {
@@ -37,9 +42,17 @@ pub struct AgentClient {
 }
 
 impl AgentClient {
-    pub fn new(url: impl Into<String>) -> Self {
+    /// `timeout_secs` bounds the decide round-trip. A reasoning completion over
+    /// OpenRouter is genuinely slow (tens of seconds), so the default is generous
+    /// (~45s); a truly dead Agent trips the timeout, which the caller turns into a
+    /// loud, recorded fallback to the local policy rather than an indefinite hang.
+    pub fn new(url: impl Into<String>, timeout_secs: u64) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             url: url.into(),
         }
     }
