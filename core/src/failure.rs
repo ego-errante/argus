@@ -24,8 +24,11 @@ pub const INJECT_CU_LIMIT: u32 = 1;
 pub const OVERSPEND_LAMPORTS: u64 = 1_000_000_000_000_000;
 
 /// Remedy tuning (kept as module consts — operationally fixed, not env knobs).
-const RAISE_CU_FLOOR: u32 = 200_000; // comfortably above our payload's need
-const MAX_CU_LIMIT: u32 = 1_400_000; // Solana per-tx compute cap
+const CU_MARGIN_NUMERATOR: u32 = 3; // 1.5x headroom over the observed CU need
+const CU_MARGIN_DENOMINATOR: u32 = 2;
+const RAISE_CU_FLOOR_MIN: u32 = 1_000; // never raise to a uselessly tiny limit
+/// Solana per-tx compute cap — also the ceiling for the RaiseCuLimit max-CU re-sim.
+pub const MAX_CU_LIMIT: u32 = 1_400_000;
 const TIP_BUMP_NUMERATOR: u64 = 3; // 1.5x
 const TIP_BUMP_DENOMINATOR: u64 = 2;
 
@@ -50,43 +53,51 @@ pub fn parse_injection(raw: Option<&str>) -> Option<Injection> {
 }
 
 /// Map a preflight `SimResult` to a `FailureClass` — the central testable unit.
-/// Case-insensitive substring match on the combined `err` + `logs`, MOST-SPECIFIC
-/// FIRST (order is load-bearing: a compute error's `err` also contains
-/// "InstructionError", so compute must be tested before the generic bundle catch).
-/// `FeeTooLow` is intentionally absent: it is a probabilistic landing outcome, not
-/// anything simulation reports. Any other non-empty `err` is an Organic Failure
-/// (PLAN.md) -> `BundleFailure`.
+/// Keys on the STRUCTURED `instruction_error` variant (parsed once from the runtime
+/// error in `rpc::sim_result_from_response`), not on substrings of flattened JSON —
+/// the lossy string match is what let the real `ComputationalBudgetExceeded` enum slip
+/// past once (ADR 0010). `FeeTooLow` is intentionally absent: it is a probabilistic
+/// landing outcome, not anything simulation reports. Any other non-empty `err` is an
+/// Organic Failure (PLAN.md) -> `BundleFailure`.
 pub fn classify_failure(sim: &SimResult) -> Option<FailureClass> {
-    let hay = format!(
+    // Expired blockhash surfaces as a top-level message (string `err` or a JSON-RPC
+    // error), NOT a structured InstructionError — match it on the err+logs text first.
+    let text = format!(
         "{} {}",
         sim.err.clone().unwrap_or_default(),
         sim.logs.join(" ")
     )
     .to_lowercase();
-
-    if hay.contains("blockhashnotfound")
-        || hay.contains("blockhash not found")
-        || hay.contains("block height exceeded")
+    if text.contains("blockhashnotfound")
+        || text.contains("blockhash not found")
+        || text.contains("block height exceeded")
     {
-        Some(FailureClass::ExpiredBlockhash)
-    } else if hay.contains("computationalbudgetexceeded") // the real runtime enum name
-        || hay.contains("computebudgetexceeded")
-        || hay.contains("exceeded cus")
-        || hay.contains("exceeded compute")
-        || hay.contains("compute budget exceeded")
-    {
-        Some(FailureClass::ComputeExceeded)
-    } else if hay.contains("insufficient")
-        || hay.contains("custom program error")
-        || hay.contains("instructionerror")
-        || hay.contains("\"custom\"")
-    {
-        Some(FailureClass::BundleFailure)
-    } else if sim.err.is_some() {
-        Some(FailureClass::BundleFailure) // organic catch-all
-    } else {
-        None // would succeed
+        return Some(FailureClass::ExpiredBlockhash);
     }
+
+    // A structured instruction error is the deterministic, runtime-sourced signal:
+    // key Compute-Exceeded on the actual variant, and treat every OTHER instruction
+    // error as a Bundle (program) Failure — no substring-guessing against log prose.
+    if let Some(ie) = &sim.instruction_error {
+        let v = ie.to_lowercase();
+        if v.contains("computationalbudgetexceeded") || v.contains("computebudgetexceeded") {
+            return Some(FailureClass::ComputeExceeded);
+        }
+        return Some(FailureClass::BundleFailure);
+    }
+
+    // No structured error — fall back to compute signals in the logs, then to the
+    // organic catch-all for any remaining non-empty error.
+    if text.contains("exceeded cus")
+        || text.contains("exceeded compute")
+        || text.contains("compute budget exceeded")
+    {
+        return Some(FailureClass::ComputeExceeded);
+    }
+    if sim.err.is_some() {
+        return Some(FailureClass::BundleFailure); // organic catch-all
+    }
+    None // would succeed
 }
 
 /// The local default policy that stands in for the Agent until Day 9-10 — each
@@ -113,28 +124,42 @@ pub fn failing_payload(payer: &Pubkey, nonce: &str, self_transfer_lamports: u64)
     payload
 }
 
-/// The per-attempt knobs a Remedy can change between retries (blockhash is always
-/// re-fetched fresh per attempt, so it isn't carried here).
+/// The per-attempt knobs a Remedy can change between retries — the single carrier of
+/// the bundle's tunable inputs (blockhash is always re-fetched fresh per attempt, so
+/// it isn't carried here). Adding a future remedy knob means extending this struct,
+/// not threading another loose argument through the submit path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryState {
     pub tip_lamports: u64,
     pub cu_limit: Option<u32>,
+    pub priority_fee_microlamports: Option<u64>,
 }
 
 /// Apply a Remedy to the retry state, returning the next attempt's state and whether
-/// to continue (`false` = stop). The one place remedy semantics live.
-pub fn apply_remedy(remedy: Remedy, state: RetryState, tip_floor_p75: u64) -> (RetryState, bool) {
+/// to continue (`false` = stop). The one place remedy semantics live. `cu_used` is the
+/// TRUE compute need observed from a max-CU re-simulation (the caller measures it), so
+/// `RaiseCuLimit` derives the new limit from observation rather than a payload-tuned
+/// constant — falling back to doubling when no observation is available.
+pub fn apply_remedy(
+    remedy: Remedy,
+    state: RetryState,
+    tip_floor_p75: u64,
+    cu_used: Option<u32>,
+) -> (RetryState, bool) {
     match remedy {
         // Blockhash is re-fetched fresh each attempt; "hold" is the leader-window
         // wait. Neither changes the carried state — just retry.
         Remedy::RefreshBlockhash | Remedy::HoldAndResubmit => (state, true),
         Remedy::RaiseCuLimit => {
-            let raised = state
-                .cu_limit
-                .unwrap_or(0)
-                .saturating_mul(2)
-                .max(RAISE_CU_FLOOR)
-                .min(MAX_CU_LIMIT);
+            // Observed need × margin (preferred), else double the prior limit; floor at
+            // a small minimum, cap at the per-tx max. No payload-tuned magic constant.
+            let from_observed = cu_used
+                .map(|n| n.saturating_mul(CU_MARGIN_NUMERATOR) / CU_MARGIN_DENOMINATOR)
+                .unwrap_or(0);
+            let from_double = state.cu_limit.unwrap_or(0).saturating_mul(2);
+            let raised = from_observed
+                .max(from_double)
+                .clamp(RAISE_CU_FLOOR_MIN, MAX_CU_LIMIT);
             (
                 RetryState {
                     cu_limit: Some(raised),
@@ -192,12 +217,19 @@ fn local_decision(class: FailureClass) -> Decision {
 mod tests {
     use super::*;
 
+    // Build a SimResult the way production does — route the fixture through the real
+    // `sim_result_from_response`, so a structured `err` string (e.g. an InstructionError)
+    // populates `instruction_error` exactly as a live response would. `err` is parsed as
+    // JSON when it is JSON, else treated as a plain string error.
     fn sim(err: Option<&str>, logs: &[&str]) -> SimResult {
-        SimResult {
-            err: err.map(String::from),
-            logs: logs.iter().map(|s| s.to_string()).collect(),
-            units_consumed: None,
-        }
+        let err_json = match err {
+            None => serde_json::Value::Null,
+            Some(e) => serde_json::from_str(e).unwrap_or_else(|_| serde_json::Value::String(e.to_string())),
+        };
+        let resp = serde_json::json!({
+            "result": { "value": { "err": err_json, "logs": logs, "unitsConsumed": 0 } }
+        });
+        crate::rpc::sim_result_from_response(&resp).unwrap()
     }
 
     #[test]
@@ -276,39 +308,46 @@ mod tests {
         assert_eq!(default_remedy(FailureClass::FeeTooLow), Remedy::BumpTip);
     }
 
+    fn retry(tip_lamports: u64, cu_limit: Option<u32>) -> RetryState {
+        RetryState { tip_lamports, cu_limit, priority_fee_microlamports: None }
+    }
+
     #[test]
-    fn raise_cu_lifts_to_floor_doubles_and_caps() {
-        // From the pathological injected limit (1) -> jumps to the working floor.
-        let (s1, cont) = apply_remedy(Remedy::RaiseCuLimit, RetryState { tip_lamports: 5000, cu_limit: Some(1) }, 0);
+    fn raise_cu_derives_from_observed_need_else_doubles_and_caps() {
+        // With an observed true need (from the max-CU re-sim), raise to need × 1.5.
+        let (s0, cont) = apply_remedy(Remedy::RaiseCuLimit, retry(5000, Some(1)), 0, Some(40_000));
         assert!(cont);
-        assert_eq!(s1.cu_limit, Some(200_000), "tiny limit lifts to the working floor");
-        // Above the floor -> doubles.
-        let (s2, _) = apply_remedy(Remedy::RaiseCuLimit, RetryState { tip_lamports: 5000, cu_limit: Some(150_000) }, 0);
-        assert_eq!(s2.cu_limit, Some(300_000), "doubles when already above the floor");
-        // Doubling past the per-tx cap clamps.
-        let (s3, _) = apply_remedy(Remedy::RaiseCuLimit, RetryState { tip_lamports: 5000, cu_limit: Some(1_000_000) }, 0);
+        assert_eq!(s0.cu_limit, Some(60_000), "observed 40k need -> 1.5x headroom");
+        // No observation + the pathological injected limit (1) -> the small safety floor.
+        let (s1, _) = apply_remedy(Remedy::RaiseCuLimit, retry(5000, Some(1)), 0, None);
+        assert_eq!(s1.cu_limit, Some(1_000), "no observation, tiny prior -> safety floor");
+        // No observation, above the floor -> doubles the prior limit.
+        let (s2, _) = apply_remedy(Remedy::RaiseCuLimit, retry(5000, Some(150_000)), 0, None);
+        assert_eq!(s2.cu_limit, Some(300_000), "no observation -> doubles the prior limit");
+        // Either source past the per-tx cap clamps.
+        let (s3, _) = apply_remedy(Remedy::RaiseCuLimit, retry(5000, Some(1_000_000)), 0, Some(2_000_000));
         assert_eq!(s3.cu_limit, Some(1_400_000), "clamped at the Solana per-tx cap");
     }
 
     #[test]
     fn bump_tip_floors_at_p75_else_scales() {
         // Below p75 -> lifted to p75.
-        let (s1, cont) = apply_remedy(Remedy::BumpTip, RetryState { tip_lamports: 1_000, cu_limit: None }, 8_000);
+        let (s1, cont) = apply_remedy(Remedy::BumpTip, retry(1_000, None), 8_000, None);
         assert!(cont);
         assert_eq!(s1.tip_lamports, 8_000, "a tip below p75 is lifted to p75");
         // Above p75 -> scaled by 1.5x.
-        let (s2, _) = apply_remedy(Remedy::BumpTip, RetryState { tip_lamports: 10_000, cu_limit: None }, 1_000);
+        let (s2, _) = apply_remedy(Remedy::BumpTip, retry(10_000, None), 1_000, None);
         assert_eq!(s2.tip_lamports, 15_000, "1.5x bump when already above p75");
     }
 
     #[test]
     fn abort_stops_refresh_and_hold_are_noops() {
-        let base = RetryState { tip_lamports: 5_000, cu_limit: Some(20_000) };
-        let (s, cont) = apply_remedy(Remedy::Abort, base, 0);
+        let base = retry(5_000, Some(20_000));
+        let (s, cont) = apply_remedy(Remedy::Abort, base, 0, None);
         assert!(!cont, "Abort stops the retry loop");
         assert_eq!(s, base, "Abort doesn't mutate state");
-        assert_eq!(apply_remedy(Remedy::RefreshBlockhash, base, 0), (base, true));
-        assert_eq!(apply_remedy(Remedy::HoldAndResubmit, base, 0), (base, true));
+        assert_eq!(apply_remedy(Remedy::RefreshBlockhash, base, 0, None), (base, true));
+        assert_eq!(apply_remedy(Remedy::HoldAndResubmit, base, 0, None), (base, true));
     }
 
     #[test]

@@ -323,7 +323,7 @@ async fn slot_stream_probe(cfg: &config::Config) -> Result<()> {
     let mut seen = 0u32;
     const MAX_UPDATES: u32 = 400; // safety cap — the tracked slot finalizes well within this
 
-    let metrics = streaming::subscribe_slots(
+    let outcome = streaming::subscribe_slots(
         &cfg.yellowstone_grpc_url,
         cfg.yellowstone_x_token.as_deref(),
         cfg.stream_channel_cap,
@@ -371,11 +371,16 @@ async fn slot_stream_probe(cfg: &config::Config) -> Result<()> {
 
     info!(
         updates = seen,
-        reconnects = metrics.reconnects,
-        dropped = metrics.dropped,
-        high_water = metrics.high_water,
+        reconnects = outcome.metrics.reconnects,
+        received = outcome.metrics.received,
+        dropped = outcome.metrics.dropped,
+        high_water = outcome.metrics.high_water,
+        gave_up = outcome.gave_up,
         "STREAM: slot subscription closed"
     );
+    if outcome.gave_up {
+        warn!("STREAM: gave up after exhausting reconnects — endpoint unreachable?");
+    }
     Ok(())
 }
 
@@ -415,9 +420,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
         &SubmitCtx { cfg, store, payer: &payer, run_id: &run_id, regions: &regions, auth },
         1,
         tip_accounts[0],
-        base_tip,
-        None,
-        None,
+        &failure::RetryState { tip_lamports: base_tip, cu_limit: None, priority_fee_microlamports: None },
     )
     .await?;
     Ok(())
@@ -442,9 +445,7 @@ async fn submit_and_track_one(
     ctx: &SubmitCtx<'_>,
     attempt: i64,
     tip_account: solana_sdk::pubkey::Pubkey,
-    tip_lamports: u64,
-    cu_limit: Option<u32>,
-    priority_fee: Option<u64>,
+    retry: &failure::RetryState,
 ) -> Result<bool> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -460,10 +461,10 @@ async fn submit_and_track_one(
         recent_blockhash,
         nonce: &nonce,
         tip_account,
-        tip_lamports,
+        tip_lamports: retry.tip_lamports,
         self_transfer_lamports: 1,
-        compute_unit_limit: cu_limit,
-        priority_fee_microlamports: priority_fee,
+        compute_unit_limit: retry.cu_limit,
+        priority_fee_microlamports: retry.priority_fee_microlamports,
     })?;
     let signature = txs[0].signatures[0].to_string();
     let explorer = format!("https://solscan.io/tx/{signature}");
@@ -475,10 +476,10 @@ async fn submit_and_track_one(
         nonce: &nonce,
         bundle_id: None,
         signature: &signature,
-        tip_lamports,
+        tip_lamports: retry.tip_lamports,
         submitted_at,
     })?;
-    info!(%run_id, attempt, %signature, %explorer, tip = tip_lamports, authed = auth.is_some(), "LIFECYCLE: Submission recorded; opening Yellowstone streams");
+    info!(%run_id, attempt, %signature, %explorer, tip = retry.tip_lamports, authed = auth.is_some(), "LIFECYCLE: Submission recorded; opening Yellowstone streams");
 
     // Submit AFTER the subscription is live (on_subscribed) so Inclusion on the tx
     // stream is never missed. Stash the handle to read the bundle id afterward.
@@ -570,15 +571,55 @@ async fn submit_and_track_one(
         on_subscribed,
         on_event,
     );
+    let mut gave_up = false;
+    let mut timed_out = false;
     match tokio::time::timeout(std::time::Duration::from_secs(60), track).await {
-        Ok(Ok(metrics)) => info!(
-            reconnects = metrics.reconnects,
-            dropped = metrics.dropped,
-            high_water = metrics.high_water,
-            "LIFECYCLE: stream closed"
-        ),
+        Ok(Ok(outcome)) => {
+            gave_up = outcome.gave_up;
+            info!(
+                reconnects = outcome.metrics.reconnects,
+                received = outcome.metrics.received,
+                dropped = outcome.metrics.dropped,
+                high_water = outcome.metrics.high_water,
+                gave_up = outcome.gave_up,
+                "LIFECYCLE: stream closed"
+            );
+        }
         Ok(Err(e)) => warn!(error = %e, "LIFECYCLE: stream error"),
-        Err(_) => warn!("LIFECYCLE: timed out before finalize — bundle may not have landed"),
+        Err(_) => timed_out = true,
+    }
+
+    // If the producer gave up before the bundle was ever submitted (on_subscribed
+    // never fired), nothing was broadcast — surface that, don't report a benign
+    // non-landing against a recorded-but-never-sent Submission.
+    let submit_fired = submit_handle.lock().unwrap().is_some();
+    if gave_up && !submit_fired {
+        anyhow::bail!(
+            "LIFECYCLE: streaming never connected (producer gave up after exhausting reconnects) — bundle was NOT submitted"
+        );
+    }
+    if gave_up {
+        warn!("LIFECYCLE: stream gave up after exhausting reconnects — landing status uncertain, reconciling via RPC");
+    }
+
+    // Post-stream reconciliation (ADR 0009): a reconnect gap, a shed terminal frame, a
+    // give-up, or the timeout can lose the Landed event even though the bundle landed
+    // (Yellowstone replays no history). Cross-check via RPC before reporting non-landing.
+    if landed.is_none() {
+        match rpc::await_signature(&cfg.rpc_http_url, &signature, 3, 1000).await {
+            Ok(Some(slot)) => {
+                landed = Some(slot);
+                if let Err(e) = store.set_landed_slot(run_id, attempt, &nonce, slot) {
+                    warn!(error = %e, "LIFECYCLE: reconciliation set_landed_slot failed");
+                }
+                info!(slot, %signature, "LIFECYCLE: ✅ recovered landing via RPC reconciliation");
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "LIFECYCLE: reconciliation RPC check failed"),
+        }
+    }
+    if timed_out && landed.is_none() {
+        warn!("LIFECYCLE: timed out before finalize and RPC reconciliation found no landing — bundle likely did not land");
     }
 
     // The submit finished early; record the bundle id for the Lifecycle Log.
@@ -602,6 +643,34 @@ async fn submit_and_track_one(
         info!(?row, "LIFECYCLE: persisted row");
     }
     Ok(landed.is_some())
+}
+
+/// Observe the TRUE compute-unit need of the clean attempt-2 transaction by simulating
+/// it at the per-tx MAX CU ceiling — so the sim SUCCEEDS and `unitsConsumed` is the real
+/// requirement, not a capped-out figure. Feeds the RaiseCuLimit remedy so the raised
+/// limit is derived from observation, not a payload-tuned constant (ADR 0010 hardening).
+async fn observe_cu_need(
+    cfg: &config::Config,
+    payer: &solana_sdk::signature::Keypair,
+    run_id: &str,
+    tip_lamports: u64,
+    tip_account: solana_sdk::pubkey::Pubkey,
+) -> Result<u32> {
+    let recent_blockhash = rpc::get_latest_blockhash(&cfg.rpc_http_url).await?;
+    let nonce = format!("argus-{run_id}-jito-2");
+    let txs = bundle::build_bundle(&bundle::BundleParams {
+        payer,
+        recent_blockhash,
+        nonce: &nonce,
+        tip_account,
+        tip_lamports,
+        self_transfer_lamports: 1,
+        compute_unit_limit: Some(failure::MAX_CU_LIMIT),
+        priority_fee_microlamports: None,
+    })?;
+    let sim = rpc::simulate_transaction(&cfg.rpc_http_url, &txs[0]).await?;
+    sim.units_consumed
+        .ok_or_else(|| anyhow::anyhow!("max-CU re-sim returned no unitsConsumed: err={:?}", sim.err))
 }
 
 /// Faulted lifecycle run (ARGUS_INJECT, ADR 0010): build an attempt-1 bundle carrying
@@ -678,12 +747,19 @@ async fn injection_run(
     let class = failure::classify_failure(&sim).unwrap_or(model::FailureClass::BundleFailure);
     store.set_failure_class(run_id, attempt, &nonce, class)?;
     let err_text = sim.err.clone().unwrap_or_default();
-    warn!(?injection, ?class, err = %err_text, units_consumed = ?sim.units_consumed, "INJECT: classified Failure");
+    warn!(?injection, ?class, err = %err_text, instruction_error = ?sim.instruction_error, units_consumed = ?sim.units_consumed, "INJECT: classified Failure");
 
-    // 3) Decide a Remedy (local policy stands in for the Agent until Day 9-10).
-    let tip_floor_p50 = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 50).await.unwrap_or(base_tip);
-    let tip_floor_p75 = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 75).await.unwrap_or(base_tip);
-    let current_slot = rpc::get_slot(&cfg.rpc_http_url).await.unwrap_or(0);
+    // 3) Decide a Remedy (local policy stands in for the Agent until Day 9-10). These
+    // three fetches populate the FailureContext for the Day 9-10 Agent (the Local policy
+    // reads only failure_class); run them concurrently so they're off the serial path.
+    let (tip_floor_p50, tip_floor_p75, current_slot) = tokio::join!(
+        tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 50),
+        tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 75),
+        rpc::get_slot(&cfg.rpc_http_url),
+    );
+    let tip_floor_p50 = tip_floor_p50.unwrap_or(base_tip);
+    let tip_floor_p75 = tip_floor_p75.unwrap_or(base_tip);
+    let current_slot = current_slot.unwrap_or(0);
     let ctx = agent_client::FailureContext {
         failure_class: class,
         attempt: attempt as u32,
@@ -710,9 +786,26 @@ async fn injection_run(
     )?;
     info!(?class, remedy = ?decision.remedy, rationale = %decision.rationale, "INJECT: Remedy chosen");
 
-    // 4) Execute the Remedy hook: next-attempt state, or stop on Abort.
-    let state = RetryState { tip_lamports: base_tip, cu_limit };
-    let (next, cont) = failure::apply_remedy(decision.remedy, state, tip_floor_p75);
+    // 4) Execute the Remedy hook: next-attempt state, or stop on Abort. For a compute
+    // remedy, observe the TRUE CU need from a max-CU re-simulation of the clean attempt-2
+    // tx (the failed attempt-1 sim's units_consumed ≈ the injected cap, so it can't be
+    // read directly) — apply_remedy then DERIVES the limit instead of using a magic floor.
+    let cu_used = if decision.remedy == model::Remedy::RaiseCuLimit {
+        match observe_cu_need(cfg, payer, run_id, base_tip, tip_accounts[1 % tip_accounts.len()]).await {
+            Ok(n) => {
+                info!(observed_cu_need = n, "INJECT: max-CU re-sim observed the true compute need");
+                Some(n)
+            }
+            Err(e) => {
+                warn!(error = %e, "INJECT: max-CU re-sim failed — falling back to doubling the prior limit");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let state = RetryState { tip_lamports: base_tip, cu_limit, priority_fee_microlamports: None };
+    let (next, cont) = failure::apply_remedy(decision.remedy, state, tip_floor_p75, cu_used);
     if !cont {
         warn!(?class, remedy = ?decision.remedy, "INJECT: Remedy = Abort — not retrying (Failure recorded, no landing)");
         if let Some(row) = store.fetch_submission(run_id, attempt, &nonce)? {
@@ -727,9 +820,7 @@ async fn injection_run(
         &SubmitCtx { cfg, store, payer, run_id, regions, auth },
         2,
         tip_accounts[1 % tip_accounts.len()],
-        next.tip_lamports,
-        next.cu_limit,
-        None,
+        &next,
     )
     .await?;
     if landed {

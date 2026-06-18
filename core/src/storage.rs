@@ -5,6 +5,7 @@ use crate::model::{FailureClass, Remedy};
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
+use tracing::warn;
 
 /// Serde snake_case token for a domain enum (matches the column comments + the TS
 /// Agent's zod enums). The enums always serialize to a JSON string, so this is total.
@@ -13,6 +14,15 @@ fn enum_token<T: serde::Serialize>(value: T) -> String {
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Surface an UPDATE that matched no row. For the UNCONDITIONAL setters (no `IS NULL`
+/// guard) 0 rows means the (run_id, attempt, nonce) key drifted from the submission —
+/// the write silently did nothing, which would otherwise look like success.
+fn warn_no_rows(rows: usize, op: &str, run_id: &str, attempt: i64, nonce: &str) {
+    if rows == 0 {
+        warn!(op, run_id, attempt, nonce, "UPDATE matched no submission row — key drift, write dropped");
+    }
 }
 
 pub struct Store {
@@ -108,19 +118,21 @@ impl Store {
 
     /// Set the bundle id once the regional fan-out returns it.
     pub fn set_bundle_id(&self, run_id: &str, attempt: i64, nonce: &str, bundle_id: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        let rows = self.conn.lock().unwrap().execute(
             "UPDATE submissions SET bundle_id = ?4 WHERE run_id = ?1 AND attempt = ?2 AND nonce = ?3",
             params![run_id, attempt, nonce, bundle_id],
         )?;
+        warn_no_rows(rows, "set_bundle_id", run_id, attempt, nonce);
         Ok(())
     }
 
     /// Record Inclusion: the landing slot detected on the transaction stream.
     pub fn set_landed_slot(&self, run_id: &str, attempt: i64, nonce: &str, slot: u64) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        let rows = self.conn.lock().unwrap().execute(
             "UPDATE submissions SET landed_slot = ?4 WHERE run_id = ?1 AND attempt = ?2 AND nonce = ?3",
             params![run_id, attempt, nonce, slot as i64],
         )?;
+        warn_no_rows(rows, "set_landed_slot", run_id, attempt, nonce);
         Ok(())
     }
 
@@ -189,10 +201,11 @@ impl Store {
         nonce: &str,
         class: FailureClass,
     ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        let rows = self.conn.lock().unwrap().execute(
             "UPDATE submissions SET failure_class = ?4 WHERE run_id = ?1 AND attempt = ?2 AND nonce = ?3",
             params![run_id, attempt, nonce, enum_token(class)],
         )?;
+        warn_no_rows(rows, "set_failure_class", run_id, attempt, nonce);
         Ok(())
     }
 

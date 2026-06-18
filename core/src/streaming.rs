@@ -15,6 +15,7 @@
 //! Commitment Progression deltas. `Commitment::from_slot_status` is that filter.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -154,12 +155,35 @@ impl StreamMetrics {
     }
 }
 
+/// The result of a resilient subscription: the lag/drop accounting PLUS whether the
+/// producer GAVE UP (exhausted the reconnect ceiling, or never connected at all) as
+/// opposed to the consumer stopping cleanly. Without this flag a total streaming
+/// outage is indistinguishable from a clean finalize — callers need to tell them apart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeOutcome {
+    pub metrics: StreamMetrics,
+    pub gave_up: bool,
+}
+
+/// Whether to stop reconnecting. The ceiling is **cumulative** (total reconnects over
+/// the whole subscription), not consecutive — so a connection that flaps (subscribe →
+/// one frame → drop, repeatedly) can't reset its way past the cap. Pure + unit-tested;
+/// the reconnect loop that calls it is integration-verified live.
+pub fn should_give_up(total_reconnects: u32, max_reconnects: u32) -> bool {
+    total_reconnects > max_reconnects
+}
+
 /// The gRPC receive task: owns the stream, maps each update to an event `E`, and
 /// `try_send`s it into the bounded channel (shedding + counting on a full channel).
-/// On a dropped/errored stream it reconnects with `backoff_delay`, giving up after
-/// `max_reconnects` (soft signal — never panics). Fires `on_subscribed` once, after
-/// the FIRST successful subscribe (the caller submits then, so Inclusion isn't
-/// missed); reconnects do not re-fire it. Returning / dropping `tx` ends the consumer.
+/// On a dropped/errored stream it reconnects with `backoff_delay`, giving up once the
+/// CUMULATIVE reconnect count passes `max_reconnects` (soft signal — never panics) and
+/// setting `gave_up` so the caller can tell an outage from a clean finish. Two
+/// counters: `total_reconnects` (cumulative — bounds a flapping endpoint) drives the
+/// ceiling; `consecutive_failures` drives the backoff delay and resets only on a real
+/// mapped event (a bare ping must not reset it, or a pinging-then-dropping endpoint
+/// would loop at the floor forever). Fires `on_subscribed` once after the first
+/// subscribe; reconnects do not re-fire it. Returning / dropping `tx` ends the consumer.
+#[allow(clippy::too_many_arguments)]
 async fn run_producer<E>(
     grpc_url: String,
     x_token: Option<String>,
@@ -168,9 +192,11 @@ async fn run_producer<E>(
     max_reconnects: u32,
     tx: mpsc::Sender<E>,
     metrics: Arc<Mutex<StreamMetrics>>,
+    gave_up: Arc<AtomicBool>,
     mut on_subscribed: Option<Box<dyn FnOnce() + Send>>,
 ) {
-    let mut backoff_attempt = 0u32;
+    let mut total_reconnects = 0u32; // cumulative — enforces the ceiling
+    let mut consecutive_failures = 0u32; // drives backoff; reset on real data
     loop {
         let connect = async {
             let mut client = grpc_builder(&grpc_url, x_token.as_deref())?.connect().await?;
@@ -182,25 +208,28 @@ async fn run_producer<E>(
         let mut stream = match connect {
             Ok(s) => s,
             Err(e) => {
-                backoff_attempt += 1;
+                total_reconnects += 1;
+                consecutive_failures += 1;
                 metrics.lock().unwrap().record_reconnect();
-                if backoff_attempt > max_reconnects {
-                    warn!(error = %e, max_reconnects, "stream connect failed — reconnect ceiling hit, giving up");
+                if should_give_up(total_reconnects, max_reconnects) {
+                    gave_up.store(true, Ordering::Relaxed);
+                    warn!(error = %e, total_reconnects, max_reconnects, "stream connect failed — reconnect ceiling hit, giving up");
                     return;
                 }
-                warn!(attempt = backoff_attempt, error = %e, "stream connect failed — backing off");
-                tokio::time::sleep(backoff_delay(backoff_attempt)).await;
+                warn!(attempt = consecutive_failures, error = %e, "stream connect failed — backing off");
+                tokio::time::sleep(backoff_delay(consecutive_failures)).await;
                 continue;
             }
         };
 
-        // Stream is live: the server-side subscription is active the instant
-        // subscribe_once returns, so submitting now can't miss Inclusion.
+        // subscribe_once issued; fire on_subscribed once so the caller submits the
+        // bundle. NB: this is the client-side subscribe returning, not a server ACK —
+        // if the server installs the tx filter slightly later, a landing in that gap
+        // is recovered by the caller's post-stream RPC reconciliation (ADR 0009).
         if let Some(cb) = on_subscribed.take() {
             cb();
         }
 
-        let mut got_data = false;
         while let Some(message) = stream.next().await {
             let update = match message {
                 Ok(u) => u,
@@ -209,23 +238,19 @@ async fn run_producer<E>(
                     break;
                 }
             };
-            // Any frame (incl. ping) proves the connection healthy → fresh backoff.
-            if !got_data {
-                got_data = true;
-                backoff_attempt = 0;
-            }
             let Some(ev) = update.update_oneof.and_then(&map_update) else {
-                continue; // ping/pong and untracked update kinds
+                continue; // ping/pong and untracked update kinds — NOT a health signal
             };
+            // A real mapped event proves the stream is delivering data → the
+            // connection recovered, so reset the backoff (but never the cumulative cap).
+            consecutive_failures = 0;
+            let depth = tx.max_capacity() - tx.capacity(); // backlog BEFORE this send
             match tx.try_send(ev) {
-                Ok(()) => {
-                    let depth = tx.max_capacity() - tx.capacity();
-                    metrics.lock().unwrap().record_send(true, depth);
-                }
+                Ok(()) => metrics.lock().unwrap().record_send(true, depth),
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     let dropped = {
                         let mut m = metrics.lock().unwrap();
-                        m.record_send(false, tx.max_capacity());
+                        m.record_send(false, depth);
                         m.dropped
                     };
                     if dropped == 1 || dropped % 256 == 0 {
@@ -240,21 +265,24 @@ async fn run_producer<E>(
             return;
         }
         // Stream ended or errored while the consumer is still listening — reconnect.
-        backoff_attempt += 1;
+        total_reconnects += 1;
+        consecutive_failures += 1;
         metrics.lock().unwrap().record_reconnect();
-        if backoff_attempt > max_reconnects {
-            warn!(max_reconnects, "stream reconnect ceiling hit — giving up (soft signal)");
+        if should_give_up(total_reconnects, max_reconnects) {
+            gave_up.store(true, Ordering::Relaxed);
+            warn!(total_reconnects, max_reconnects, "stream reconnect ceiling hit — giving up (soft signal)");
             return;
         }
-        tokio::time::sleep(backoff_delay(backoff_attempt)).await;
+        tokio::time::sleep(backoff_delay(consecutive_failures)).await;
     }
 }
 
 /// Generalized resilient subscription: spawn the gRPC receive task (reconnect +
 /// bounded-channel backpressure) and drain its events on THIS task into `on_event`
 /// — so the callback may borrow non-`Send` local state, as the lifecycle consumer
-/// does. Returns `StreamMetrics` once the consumer stops (callback returns `false`)
-/// or the producer gives up. `E` is the consumer's decoded event type.
+/// does. Returns a `SubscribeOutcome` (metrics + `gave_up`) once the consumer stops
+/// (callback returns `false`) or the producer gives up. `E` is the decoded event type.
+#[allow(clippy::too_many_arguments)]
 async fn resilient_subscribe<E>(
     grpc_url: &str,
     x_token: Option<&str>,
@@ -264,12 +292,13 @@ async fn resilient_subscribe<E>(
     channel_cap: usize,
     max_reconnects: u32,
     mut on_event: impl FnMut(E) -> bool,
-) -> Result<StreamMetrics>
+) -> Result<SubscribeOutcome>
 where
     E: Send + 'static,
 {
     let (tx, mut rx) = mpsc::channel::<E>(channel_cap);
     let metrics = Arc::new(Mutex::new(StreamMetrics::default()));
+    let gave_up = Arc::new(AtomicBool::new(false));
     let producer = tokio::spawn(run_producer(
         grpc_url.to_string(),
         x_token.map(String::from),
@@ -278,6 +307,7 @@ where
         max_reconnects,
         tx,
         Arc::clone(&metrics),
+        Arc::clone(&gave_up),
         on_subscribed,
     ));
 
@@ -288,24 +318,27 @@ where
     }
 
     // The producer may be parked in `stream.next()`, so abort rather than join —
-    // the metrics it accumulated live in the shared Arc, not its return value.
+    // the metrics + gave_up it accumulated live in the shared state, not its return.
     producer.abort();
     let _ = producer.await;
-    let m = *metrics.lock().unwrap();
-    Ok(m)
+    let metrics = *metrics.lock().unwrap();
+    Ok(SubscribeOutcome {
+        metrics,
+        gave_up: gave_up.load(Ordering::Relaxed),
+    })
 }
 
 /// Connect to a Yellowstone gRPC endpoint and stream slot commitment updates,
 /// invoking `on_update` for each Processed/Confirmed/Finalized transition. The
 /// callback returns `false` to stop. Resilient: reconnects with backoff and sheds
-/// surplus updates on a full bounded channel (ADR 0009); returns the StreamMetrics.
+/// surplus updates on a full bounded channel (ADR 0009); returns the SubscribeOutcome.
 pub async fn subscribe_slots(
     grpc_url: &str,
     x_token: Option<&str>,
     channel_cap: usize,
     max_reconnects: u32,
     on_update: impl FnMut(SlotUpdate) -> bool,
-) -> Result<StreamMetrics> {
+) -> Result<SubscribeOutcome> {
     resilient_subscribe(
         grpc_url,
         x_token,
@@ -409,7 +442,7 @@ pub async fn track_lifecycle(
     max_reconnects: u32,
     on_subscribed: impl FnOnce() + Send + 'static,
     on_event: impl FnMut(LifecycleEvent) -> bool,
-) -> Result<StreamMetrics> {
+) -> Result<SubscribeOutcome> {
     resilient_subscribe(
         grpc_url,
         x_token,
@@ -478,6 +511,15 @@ mod tests {
             m.record_reconnect();
         }
         assert_eq!(m.reconnects, 4);
+    }
+
+    #[test]
+    fn give_up_only_past_the_cumulative_ceiling() {
+        // The ceiling is cumulative: a flapping endpoint can't reset its way past it.
+        assert!(!should_give_up(10, 10), "at the ceiling, keep trying");
+        assert!(should_give_up(11, 10), "one past the ceiling gives up");
+        assert!(!should_give_up(0, 10), "no reconnects yet → keep going");
+        assert!(should_give_up(1, 0), "a zero ceiling gives up after the first reconnect");
     }
 
     #[test]
