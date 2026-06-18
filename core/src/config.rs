@@ -37,6 +37,8 @@ pub struct Config {
     /// receive task and the consumer, and the reconnect ceiling before giving up.
     pub stream_channel_cap: usize,
     pub stream_max_reconnects: u32,
+    /// Deterministic fault to inject (ARGUS_INJECT, ADR 0010). `None` = clean run.
+    pub injection: Option<crate::failure::Injection>,
     pub keypair_path: String,
     pub agent_url: String,
     pub db_path: String,
@@ -158,6 +160,9 @@ impl Config {
             stream_max_reconnects: env_num_positive(
                 "ARGUS_STREAM_MAX_RECONNECTS",
                 crate::streaming::DEFAULT_MAX_RECONNECTS,
+            ),
+            injection: crate::failure::parse_injection(
+                std::env::var("ARGUS_INJECT").ok().as_deref(),
             ),
             keypair_path: std::env::var("KEYPAIR_PATH")
                 .unwrap_or_else(|_| "./secrets/keypair.json".into()),

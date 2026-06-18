@@ -1,9 +1,19 @@
 //! SQLite source of truth for the Lifecycle Log (ADR 0004 / PLAN.md).
 //! JSONL + the Markdown table are exported from this (Day 11).
 
+use crate::model::{FailureClass, Remedy};
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
+
+/// Serde snake_case token for a domain enum (matches the column comments + the TS
+/// Agent's zod enums). The enums always serialize to a JSON string, so this is total.
+fn enum_token<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -170,7 +180,54 @@ impl Store {
         Ok(row)
     }
 
-    // TODO (Day 9-10): record_decision (Remedy + Reasoning Trace).
+    /// Persist the classified Failure Class for a Submission (the Lifecycle Log
+    /// column). Stores the serde snake_case token (`expired_blockhash`, ...).
+    pub fn set_failure_class(
+        &self,
+        run_id: &str,
+        attempt: i64,
+        nonce: &str,
+        class: FailureClass,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE submissions SET failure_class = ?4 WHERE run_id = ?1 AND attempt = ?2 AND nonce = ?3",
+            params![run_id, attempt, nonce, enum_token(class)],
+        )?;
+        Ok(())
+    }
+
+    /// Record a Remedy decision + its Reasoning Trace into the `decisions` table.
+    /// Day 7-8 writes the local default policy's decision here; Day 9-10 swaps the
+    /// source to the Agent without changing this sink.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_decision(
+        &self,
+        run_id: &str,
+        attempt: i64,
+        class: FailureClass,
+        remedy: Remedy,
+        rationale: &str,
+        confidence: Option<f64>,
+        reasoning_trace: Option<&str>,
+        decided_at: i64,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, rationale, confidence, reasoning_trace, decided_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                attempt,
+                enum_token(class),
+                enum_token(remedy),
+                rationale,
+                confidence,
+                reasoning_trace,
+                decided_at
+            ],
+        )?;
+        Ok(())
+    }
+
     // TODO (Day 11): export_jsonl / export_markdown_table (with explorer links + deltas).
 }
 
@@ -243,5 +300,43 @@ mod tests {
         s.set_bundle_id("run-1", 1, "argus-1-jito-1", "bundle-abc").unwrap();
         let row = s.fetch_submission("run-1", 1, "argus-1-jito-1").unwrap().unwrap();
         assert_eq!(row.bundle_id.as_deref(), Some("bundle-abc"));
+    }
+
+    #[test]
+    fn set_failure_class_persists_the_snake_case_token() {
+        let s = store();
+        s.record_submission(&sample()).unwrap();
+        s.set_failure_class("run-1", 1, "argus-1-jito-1", FailureClass::ComputeExceeded)
+            .unwrap();
+        let row = s.fetch_submission("run-1", 1, "argus-1-jito-1").unwrap().unwrap();
+        assert_eq!(row.failure_class.as_deref(), Some("compute_exceeded"));
+    }
+
+    #[test]
+    fn record_decision_round_trips() {
+        let s = store();
+        s.record_decision(
+            "run-1",
+            1,
+            FailureClass::ExpiredBlockhash,
+            Remedy::RefreshBlockhash,
+            "local default policy",
+            Some(1.0),
+            None,
+            42,
+        )
+        .unwrap();
+        // The test lives in the storage module, so it can read the private conn.
+        let conn = s.conn.lock().unwrap();
+        let (class, remedy, decided): (String, String, i64) = conn
+            .query_row(
+                "SELECT failure_class, remedy, decided_at FROM decisions WHERE run_id = ?1 AND attempt = ?2",
+                params!["run-1", 1],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(class, "expired_blockhash");
+        assert_eq!(remedy, "refresh_blockhash");
+        assert_eq!(decided, 42);
     }
 }

@@ -12,6 +12,7 @@ mod storage;
 
 // Filled in across the PLAN.md milestones:
 mod bundle; // Day 5-6: Jito bundle construction + submission
+mod failure; // Day 7-8: fault injection + classification + local remedy policy
 mod leader; // Day 5-6: getNextScheduledLeader + slot stream -> Leader Window
 mod sender; // Day 1-2: Helius Sender submission (primary landing path, ADR 0007)
 mod streaming; // Day 3-4 + 7-8: Yellowstone slot-sub + tx-sub, backpressure, reconnect
@@ -390,49 +391,94 @@ fn stage_delta_ms(a: Option<u128>, b: Option<u128>) -> i64 {
 /// through the two-stream model (ADR 0004) — Inclusion (transaction stream) +
 /// Commitment Progression (slot stream) — persisting submitted/landed/processed/
 /// confirmed/finalized to SQLite, then logging the deltas (the Lifecycle Log data).
+/// With ARGUS_INJECT set, the run becomes inject → classify → remedy → resubmit
+/// (ADR 0010); see `injection_run`.
 async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<()> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    use storage::Stage;
-    use streaming::{Commitment, LifecycleEvent};
-
     let payer = wallet::load_keypair(&cfg.keypair_path)?;
     info!(payer = %payer.pubkey(), "LIFECYCLE: loaded fee-payer keypair");
 
     let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, cfg.jito_tip_percentile).await?;
     let run_id = format!("run-{}", now_millis());
-    let attempt: i64 = 1;
-    let nonce = format!("argus-{run_id}-jito-{attempt}");
-
     let regions = bundle::regional_endpoints();
     let auth = cfg.jito_auth_uuid.as_deref();
     let tip_accounts = bundle::published_tip_accounts();
 
+    if let Some(injection) = cfg.injection {
+        return injection_run(
+            cfg, store, &payer, &run_id, base_tip, &regions, auth, &tip_accounts, injection,
+        )
+        .await;
+    }
+
+    // Clean run: one submission tracked to finalize.
+    submit_and_track_one(
+        &SubmitCtx { cfg, store, payer: &payer, run_id: &run_id, regions: &regions, auth },
+        1,
+        tip_accounts[0],
+        base_tip,
+        None,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Shared context for one submission+track attempt (keeps the arg list sane).
+#[derive(Clone, Copy)]
+struct SubmitCtx<'a> {
+    cfg: &'a config::Config,
+    store: &'a storage::Store,
+    payer: &'a solana_sdk::signature::Keypair,
+    run_id: &'a str,
+    regions: &'a [String],
+    auth: Option<&'a str>,
+}
+
+/// Build a clean bundle for one attempt, open the Yellowstone lifecycle streams,
+/// submit after the subscription is live, and persist Inclusion + Commitment
+/// Progression to SQLite. Returns whether it landed. Shared by the clean run and the
+/// post-remedy retry (ADR 0010), so the proven stream-tracking path lives in one place.
+async fn submit_and_track_one(
+    ctx: &SubmitCtx<'_>,
+    attempt: i64,
+    tip_account: solana_sdk::pubkey::Pubkey,
+    tip_lamports: u64,
+    cu_limit: Option<u32>,
+    priority_fee: Option<u64>,
+) -> Result<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use storage::Stage;
+    use streaming::{Commitment, LifecycleEvent};
+
+    let SubmitCtx { cfg, store, payer, run_id, regions, auth } = *ctx;
+    let nonce = format!("argus-{run_id}-jito-{attempt}");
+
     let recent_blockhash = rpc::get_latest_blockhash(&cfg.rpc_http_url).await?;
     let txs = bundle::build_bundle(&bundle::BundleParams {
-        payer: &payer,
+        payer,
         recent_blockhash,
         nonce: &nonce,
-        tip_account: tip_accounts[0],
-        tip_lamports: base_tip,
+        tip_account,
+        tip_lamports,
         self_transfer_lamports: 1,
-        compute_unit_limit: None,
-        priority_fee_microlamports: None,
+        compute_unit_limit: cu_limit,
+        priority_fee_microlamports: priority_fee,
     })?;
     let signature = txs[0].signatures[0].to_string();
     let explorer = format!("https://solscan.io/tx/{signature}");
 
     let submitted_at = now_millis() as i64;
     store.record_submission(&storage::NewSubmission {
-        run_id: &run_id,
+        run_id,
         attempt,
         nonce: &nonce,
         bundle_id: None,
         signature: &signature,
-        tip_lamports: base_tip,
+        tip_lamports,
         submitted_at,
     })?;
-    info!(%run_id, %signature, %explorer, tip = base_tip, authed = auth.is_some(), "LIFECYCLE: Submission recorded; opening Yellowstone streams");
+    info!(%run_id, attempt, %signature, %explorer, tip = tip_lamports, authed = auth.is_some(), "LIFECYCLE: Submission recorded; opening Yellowstone streams");
 
     // Submit AFTER the subscription is live (on_subscribed) so Inclusion on the tx
     // stream is never missed. Stash the handle to read the bundle id afterward.
@@ -441,7 +487,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
     let on_subscribed = {
         let submit_handle = Arc::clone(&submit_handle);
         let submit_txs = txs.clone();
-        let submit_regions = regions.clone();
+        let submit_regions = regions.to_vec();
         let submit_auth = auth.map(String::from);
         move || {
             let h = tokio::spawn(async move {
@@ -463,7 +509,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
             LifecycleEvent::Landed { signature: sig, slot } => {
                 if landed.is_none() {
                     landed = Some(slot);
-                    if let Err(e) = store.set_landed_slot(&run_id, attempt, &nonce, slot) {
+                    if let Err(e) = store.set_landed_slot(run_id, attempt, &nonce, slot) {
                         warn!(error = %e, "LIFECYCLE: set_landed_slot failed");
                     }
                     info!(slot, signature = %sig, "LIFECYCLE: ✅ Inclusion (landed)");
@@ -472,7 +518,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
                         for (i, t) in times.iter().enumerate() {
                             if let (Some(t), false) = (t, written[i]) {
                                 written[i] = true;
-                                let _ = store.mark_stage(&run_id, attempt, &nonce, stages[i], *t as i64);
+                                let _ = store.mark_stage(run_id, attempt, &nonce, stages[i], *t as i64);
                             }
                         }
                     }
@@ -494,7 +540,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
                     let t = slot_times[&slot][idx].unwrap_or(now);
                     if !written[idx] {
                         written[idx] = true;
-                        if let Err(e) = store.mark_stage(&run_id, attempt, &nonce, stages[idx], t as i64) {
+                        if let Err(e) = store.mark_stage(run_id, attempt, &nonce, stages[idx], t as i64) {
                             warn!(error = %e, "LIFECYCLE: mark_stage failed");
                         }
                     }
@@ -541,7 +587,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
             Ok(results) => {
                 let accepted = results.iter().filter(|(_, r)| r.is_ok()).count();
                 if let Some(bid) = results.iter().find_map(|(_, r)| r.as_ref().ok().cloned()) {
-                    let _ = store.set_bundle_id(&run_id, attempt, &nonce, &bid);
+                    let _ = store.set_bundle_id(run_id, attempt, &nonce, &bid);
                     info!(accepted, total = results.len(), bundle_id = %bid, "LIFECYCLE: fan-out complete");
                 } else {
                     warn!(accepted, "LIFECYCLE: no region returned a bundle id");
@@ -552,8 +598,144 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
     }
 
     // The persisted row — SQLite source of truth for this Submission.
-    if let Some(row) = store.fetch_submission(&run_id, attempt, &nonce)? {
+    if let Some(row) = store.fetch_submission(run_id, attempt, &nonce)? {
         info!(?row, "LIFECYCLE: persisted row");
+    }
+    Ok(landed.is_some())
+}
+
+/// Faulted lifecycle run (ARGUS_INJECT, ADR 0010): build an attempt-1 bundle carrying
+/// one deterministic fault, classify it via preflight simulation (the only reason
+/// source for an all-or-nothing bundle), let the local policy (Agent stand-in) choose
+/// a Remedy, persist the Failure Class + decision, then execute the Remedy — Abort
+/// stops; otherwise attempt 2 resubmits clean and is tracked to finalize.
+#[allow(clippy::too_many_arguments)]
+async fn injection_run(
+    cfg: &config::Config,
+    store: &storage::Store,
+    payer: &solana_sdk::signature::Keypair,
+    run_id: &str,
+    base_tip: u64,
+    regions: &[String],
+    auth: Option<&str>,
+    tip_accounts: &[solana_sdk::pubkey::Pubkey],
+    injection: failure::Injection,
+) -> Result<()> {
+    use failure::{Injection, Policy, RetryState};
+    use solana_sdk::signer::Signer;
+
+    let attempt: i64 = 1;
+    let nonce = format!("argus-{run_id}-jito-{attempt}");
+
+    // 1) Build the faulted attempt-1 bundle (the injection).
+    let (recent_blockhash, cu_limit, payload_override) = match injection {
+        Injection::ExpiredBlockhash => (
+            rpc::get_aged_blockhash(&cfg.rpc_http_url, failure::AGED_BLOCKHASH_SLOTS).await?,
+            None,
+            None,
+        ),
+        Injection::ComputeExceeded => (
+            rpc::get_latest_blockhash(&cfg.rpc_http_url).await?,
+            Some(failure::INJECT_CU_LIMIT),
+            None,
+        ),
+        Injection::BundleFailure => (
+            rpc::get_latest_blockhash(&cfg.rpc_http_url).await?,
+            None,
+            Some(failure::failing_payload(&payer.pubkey(), &nonce, 1)),
+        ),
+    };
+    let params = bundle::BundleParams {
+        payer,
+        recent_blockhash,
+        nonce: &nonce,
+        tip_account: tip_accounts[0],
+        tip_lamports: base_tip,
+        self_transfer_lamports: 1,
+        compute_unit_limit: cu_limit,
+        priority_fee_microlamports: None,
+    };
+    let txs = match payload_override {
+        Some(payload) => bundle::build_bundle_with_payload(&params, payload)?,
+        None => bundle::build_bundle(&params)?,
+    };
+    let signature = txs[0].signatures[0].to_string();
+    let explorer = format!("https://solscan.io/tx/{signature}");
+
+    store.record_submission(&storage::NewSubmission {
+        run_id,
+        attempt,
+        nonce: &nonce,
+        bundle_id: None,
+        signature: &signature,
+        tip_lamports: base_tip,
+        submitted_at: now_millis() as i64,
+    })?;
+    info!(?injection, %signature, %explorer, "INJECT: built faulted bundle — simulating to classify");
+
+    // 2) Classify via preflight simulation (the deterministic reason source).
+    let sim = rpc::simulate_transaction(&cfg.rpc_http_url, &txs[0]).await?;
+    let class = failure::classify_failure(&sim).unwrap_or(model::FailureClass::BundleFailure);
+    store.set_failure_class(run_id, attempt, &nonce, class)?;
+    let err_text = sim.err.clone().unwrap_or_default();
+    warn!(?injection, ?class, err = %err_text, units_consumed = ?sim.units_consumed, "INJECT: classified Failure");
+
+    // 3) Decide a Remedy (local policy stands in for the Agent until Day 9-10).
+    let tip_floor_p50 = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 50).await.unwrap_or(base_tip);
+    let tip_floor_p75 = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 75).await.unwrap_or(base_tip);
+    let current_slot = rpc::get_slot(&cfg.rpc_http_url).await.unwrap_or(0);
+    let ctx = agent_client::FailureContext {
+        failure_class: class,
+        attempt: attempt as u32,
+        error_text: &err_text,
+        tip_lamports: base_tip,
+        tip_floor_p50,
+        tip_floor_p75,
+        blockhash_age_slots: matches!(injection, Injection::ExpiredBlockhash)
+            .then_some(failure::AGED_BLOCKHASH_SLOTS),
+        cu_limit,
+        cu_used: sim.units_consumed,
+        current_slot,
+    };
+    let decision = Policy::Local.decide(&ctx).await?;
+    store.record_decision(
+        run_id,
+        attempt,
+        class,
+        decision.remedy,
+        &decision.rationale,
+        Some(decision.confidence),
+        decision.reasoning_trace.as_deref(),
+        now_millis() as i64,
+    )?;
+    info!(?class, remedy = ?decision.remedy, rationale = %decision.rationale, "INJECT: Remedy chosen");
+
+    // 4) Execute the Remedy hook: next-attempt state, or stop on Abort.
+    let state = RetryState { tip_lamports: base_tip, cu_limit };
+    let (next, cont) = failure::apply_remedy(decision.remedy, state, tip_floor_p75);
+    if !cont {
+        warn!(?class, remedy = ?decision.remedy, "INJECT: Remedy = Abort — not retrying (Failure recorded, no landing)");
+        if let Some(row) = store.fetch_submission(run_id, attempt, &nonce)? {
+            info!(?row, "INJECT: persisted faulted row");
+        }
+        return Ok(());
+    }
+
+    // 5) Attempt 2: clean submission with the Remedy applied, tracked to finalize.
+    info!(next_tip = next.tip_lamports, next_cu = ?next.cu_limit, "INJECT: applying Remedy and resubmitting (attempt 2)");
+    let landed = submit_and_track_one(
+        &SubmitCtx { cfg, store, payer, run_id, regions, auth },
+        2,
+        tip_accounts[1 % tip_accounts.len()],
+        next.tip_lamports,
+        next.cu_limit,
+        None,
+    )
+    .await?;
+    if landed {
+        info!(?class, "INJECT: ✅ recovered — attempt 2 landed after the Remedy");
+    } else {
+        warn!(?class, "INJECT: attempt 2 did not land");
     }
     Ok(())
 }
