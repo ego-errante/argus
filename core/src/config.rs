@@ -33,6 +33,10 @@ pub struct Config {
     pub sender_swqos_min_tip_lamports: u64,
     pub sender_compute_unit_limit: u32,
     pub sender_priority_fee_microlamports: u64,
+    /// Streaming resilience (ADR 0009): bounded-channel capacity between the gRPC
+    /// receive task and the consumer, and the reconnect ceiling before giving up.
+    pub stream_channel_cap: usize,
+    pub stream_max_reconnects: u32,
     pub keypair_path: String,
     pub agent_url: String,
     pub db_path: String,
@@ -146,6 +150,14 @@ impl Config {
             sender_priority_fee_microlamports: env_num_positive(
                 "SENDER_PRIORITY_FEE_MICROLAMPORTS",
                 crate::sender::PRIORITY_FEE_MICROLAMPORTS,
+            ),
+            stream_channel_cap: env_num_positive(
+                "ARGUS_STREAM_CHANNEL_CAP",
+                crate::streaming::DEFAULT_CHANNEL_CAP,
+            ),
+            stream_max_reconnects: env_num_positive(
+                "ARGUS_STREAM_MAX_RECONNECTS",
+                crate::streaming::DEFAULT_MAX_RECONNECTS,
             ),
             keypair_path: std::env::var("KEYPAIR_PATH")
                 .unwrap_or_else(|_| "./secrets/keypair.json".into()),

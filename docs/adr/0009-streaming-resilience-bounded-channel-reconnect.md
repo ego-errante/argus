@@ -1,0 +1,18 @@
+# Resilient Yellowstone subscriptions: bounded-channel backpressure + exponential-backoff reconnect
+
+The two Yellowstone consumers (`subscribe_slots`, `track_lifecycle`) share one generalized resilient driver (`streaming::resilient_subscribe`): a spawned **receive task** owns the gRPC stream and `try_send`s decoded events into a **bounded `mpsc` channel**; the **consumer** drains that channel on the caller's task and runs the existing synchronous callback. A dropped/errored stream is reconnected with exponential backoff (`backoff_delay`); a full channel sheds the surplus event and counts it. The driver returns a `StreamMetrics { reconnects, received, dropped, high_water }` summary, logged at run end. This closes the reconnection / backpressure deferral from ADR 0004.
+
+## Why
+
+PLAN.md calls bounded-channel backpressure + reconnection with logged lag/drop metrics "the one hard required feature." Without it a single transient gRPC disconnect ends lifecycle tracking mid-flight, and a consumer slower than the stream buffers unboundedly toward OOM. The split (spawned producer ↔ caller-task consumer) is load-bearing: the lifecycle consumer's callback borrows non-`Send` local state (`&Store`, the per-slot timing map), so it must stay on the caller's task — only the producer, which needs solely `Send + 'static` inputs, is spawned. A bounded channel is what gives genuine backpressure: producer and consumer run concurrently, and when the consumer lags the channel fills and we shed (with a count) instead of growing memory.
+
+## Considered options
+
+- **Per-consumer band-aid** (wrap each of `slot_stream_probe` / `lifecycle_run` in its own reconnect loop) — rejected. Two copies of the same reconnect+backpressure logic drifting apart; the right altitude is one driver both delegate to, with the consumer-specific bits (request builder, update→event mapper, callback) injected.
+- **Unbounded channel** — rejected. It removes the OOM risk's ceiling, not the risk; backpressure means a *bounded* buffer with a visible drop count, so lag is observable rather than silent latent memory growth.
+- **`try_send`-and-shed vs `send().await`-and-block** — adopted `try_send`. Blocking the receive task on a full channel would stall reading the gRPC stream, inviting server-side disconnects and defeating the point; shedding the oldest-losing surplus and counting it keeps the stream drained and the lag measurable.
+- **Add a backoff crate** (`backoff`/`tokio-retry`) — rejected. The schedule is a four-line pure function (`BASE * 2^(n-1)`, capped); hand-rolling keeps the zero-new-crates posture (cf. ADR 0008) and makes the schedule directly unit-testable.
+
+## Consequences
+
+The reconnect backoff doubles from 500 ms to a 30 s cap; the consecutive-failure counter resets once a reconnected stream delivers a frame (so a long-lived connection earns a fresh budget, while a tight flap still escalates). A `max_reconnects` ceiling (default 10) bounds a permanently-dead endpoint: on exceed the driver warns and returns its metrics rather than panicking — consistent with the soft-signal philosophy (ADR 0008). `on_subscribed` fires once, after the *first* successful subscribe (so the bundle submit still can't miss Inclusion); reconnects do not re-fire it. The pure pieces — `backoff_delay` (monotonic, capped) and `StreamMetrics` accounting (drops, high-water) — are unit-tested; the network reconnect itself is not (matching the convention that live I/O is exercised by the `ARGUS_STREAM` / `ARGUS_LIFECYCLE` probes, not unit tests). Two config knobs were added: `ARGUS_STREAM_CHANNEL_CAP` (default 1024) and `ARGUS_STREAM_MAX_RECONNECTS` (default 10).

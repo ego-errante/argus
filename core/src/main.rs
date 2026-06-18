@@ -322,9 +322,11 @@ async fn slot_stream_probe(cfg: &config::Config) -> Result<()> {
     let mut seen = 0u32;
     const MAX_UPDATES: u32 = 400; // safety cap — the tracked slot finalizes well within this
 
-    streaming::subscribe_slots(
+    let metrics = streaming::subscribe_slots(
         &cfg.yellowstone_grpc_url,
         cfg.yellowstone_x_token.as_deref(),
+        cfg.stream_channel_cap,
+        cfg.stream_max_reconnects,
         |su| {
             seen += 1;
 
@@ -366,7 +368,13 @@ async fn slot_stream_probe(cfg: &config::Config) -> Result<()> {
     )
     .await?;
 
-    info!(updates = seen, "STREAM: slot subscription closed");
+    info!(
+        updates = seen,
+        reconnects = metrics.reconnects,
+        dropped = metrics.dropped,
+        high_water = metrics.high_water,
+        "STREAM: slot subscription closed"
+    );
     Ok(())
 }
 
@@ -511,11 +519,18 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
         &cfg.yellowstone_grpc_url,
         cfg.yellowstone_x_token.as_deref(),
         &signature,
+        cfg.stream_channel_cap,
+        cfg.stream_max_reconnects,
         on_subscribed,
         on_event,
     );
     match tokio::time::timeout(std::time::Duration::from_secs(60), track).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(metrics)) => info!(
+            reconnects = metrics.reconnects,
+            dropped = metrics.dropped,
+            high_water = metrics.high_water,
+            "LIFECYCLE: stream closed"
+        ),
         Ok(Err(e)) => warn!(error = %e, "LIFECYCLE: stream error"),
         Err(_) => warn!("LIFECYCLE: timed out before finalize — bundle may not have landed"),
     }
