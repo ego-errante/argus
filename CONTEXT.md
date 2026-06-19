@@ -27,8 +27,12 @@ One bundle sent to the Jito Block Engine. The unit counted by the "≥10 real bu
 _Avoid_: send, transaction (a Submission carries a transaction but is not one)
 
 **Attempt**:
-A Submission viewed as one try at landing a particular logical payload. A payload that fails and is retried produces multiple Attempts, each its own Submission with a fresh blockhash.
+A Submission viewed as one try at landing a particular logical Payload. A Payload that fails and is retried produces multiple Attempts, each its own Submission with a fresh blockhash.
 _Avoid_: retry (use "retry" only as a verb)
+
+**Payload**:
+The logical transaction-task a Run submits — the thing an Attempt is an attempt *at*. One Payload may take several Attempts (a Failure and its retry are Attempts at the same Payload); each Attempt is its own Submission. A Run is a sequence of Payloads (here: clean Payloads plus the injected ones), giving the hierarchy Run → Payload → Attempt/Submission.
+_Avoid_: transaction (a Payload is realized as a transaction but is the logical unit), job, task
 
 **Landed** / **Inclusion**:
 The fact that a transaction was included in a produced block. This is binary and is detected via the transaction stream. Distinct from any commitment level.

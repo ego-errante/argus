@@ -42,6 +42,30 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     Ok(())
 }
 
+/// The Submission SELECT column list, in the exact order `submission_row_from` reads them.
+/// Shared by the point read (`fetch_submission`) and the Run-scoped fetch so a new column is
+/// added in ONE place — before this, adding `failure_class` had to touch both copies.
+const SUBMISSION_COLUMNS: &str = "run_id, attempt, nonce, bundle_id, signature, tip_lamports, \
+    submitted_at, landed_slot, processed_at, confirmed_at, finalized_at, failure_class";
+
+/// Build a `SubmissionRow` from a row selected with `SUBMISSION_COLUMNS` (same order).
+fn submission_row_from(r: &rusqlite::Row) -> rusqlite::Result<SubmissionRow> {
+    Ok(SubmissionRow {
+        run_id: r.get(0)?,
+        attempt: r.get(1)?,
+        nonce: r.get(2)?,
+        bundle_id: r.get(3)?,
+        signature: r.get(4)?,
+        tip_lamports: r.get(5)?,
+        submitted_at: r.get(6)?,
+        landed_slot: r.get(7)?,
+        processed_at: r.get(8)?,
+        confirmed_at: r.get(9)?,
+        finalized_at: r.get(10)?,
+        failure_class: r.get(11)?,
+    })
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -92,6 +116,22 @@ pub struct SubmissionRow {
     pub confirmed_at: Option<i64>,
     pub finalized_at: Option<i64>,
     pub failure_class: Option<String>,
+}
+
+/// A persisted Agent-decision row — the Day 11 Lifecycle Log's Agent-Decisions section
+/// (and the full Reasoning Trace in the JSONL). Joined to its faulted Submission by
+/// `(run_id, attempt)`. No `Eq` — `confidence` is an `f64`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionRow {
+    pub run_id: String,
+    pub attempt: i64,
+    pub failure_class: String,
+    pub remedy: String,
+    pub rationale: String,
+    pub confidence: Option<f64>,
+    pub reasoning_trace: Option<String>,
+    pub model: Option<String>,
+    pub decided_at: i64,
 }
 
 impl Store {
@@ -192,26 +232,12 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT run_id, attempt, nonce, bundle_id, signature, tip_lamports, submitted_at, \
-                 landed_slot, processed_at, confirmed_at, finalized_at, failure_class \
-                 FROM submissions WHERE run_id = ?1 AND attempt = ?2 AND nonce = ?3",
+                &format!(
+                    "SELECT {SUBMISSION_COLUMNS} FROM submissions \
+                     WHERE run_id = ?1 AND attempt = ?2 AND nonce = ?3"
+                ),
                 params![run_id, attempt, nonce],
-                |r| {
-                    Ok(SubmissionRow {
-                        run_id: r.get(0)?,
-                        attempt: r.get(1)?,
-                        nonce: r.get(2)?,
-                        bundle_id: r.get(3)?,
-                        signature: r.get(4)?,
-                        tip_lamports: r.get(5)?,
-                        submitted_at: r.get(6)?,
-                        landed_slot: r.get(7)?,
-                        processed_at: r.get(8)?,
-                        confirmed_at: r.get(9)?,
-                        finalized_at: r.get(10)?,
-                        failure_class: r.get(11)?,
-                    })
-                },
+                submission_row_from,
             )
             .optional()?;
         Ok(row)
@@ -268,7 +294,52 @@ impl Store {
         Ok(())
     }
 
-    // TODO (Day 11): export_jsonl / export_markdown_table (with explorer links + deltas).
+    /// All Submissions belonging to a Run, ordered chronologically (the serial Run's
+    /// natural Lifecycle-Log order). A Run is a PREFIX over child `run_id`s
+    /// `run-{ts}-p{k}` (ADR 0011 Run-ID-prefix keying), so this scopes with a LIKE on
+    /// `{run_prefix}-%` — zero schema change. `run_prefix` is `run-{ts}` (numeric ts),
+    /// which carries no LIKE wildcard (`_`/`%`), so no escaping is needed for our keys.
+    /// Rendering lives in `export.rs` (the presentation concern, kept off the Store).
+    pub fn fetch_run_submissions(&self, run_prefix: &str) -> Result<Vec<SubmissionRow>> {
+        let like = format!("{run_prefix}-%");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SUBMISSION_COLUMNS} FROM submissions \
+             WHERE run_id LIKE ?1 ORDER BY submitted_at, attempt"
+        ))?;
+        let rows = stmt
+            .query_map(params![like], submission_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// All Agent decisions belonging to a Run (same prefix scoping as
+    /// `fetch_run_submissions`), ordered by decision time.
+    pub fn fetch_run_decisions(&self, run_prefix: &str) -> Result<Vec<DecisionRow>> {
+        let like = format!("{run_prefix}-%");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, attempt, failure_class, remedy, rationale, confidence, \
+             reasoning_trace, model, decided_at \
+             FROM decisions WHERE run_id LIKE ?1 ORDER BY decided_at, attempt",
+        )?;
+        let rows = stmt
+            .query_map(params![like], |r| {
+                Ok(DecisionRow {
+                    run_id: r.get(0)?,
+                    attempt: r.get(1)?,
+                    failure_class: r.get(2)?,
+                    remedy: r.get(3)?,
+                    rationale: r.get(4)?,
+                    confidence: r.get(5)?,
+                    reasoning_trace: r.get(6)?,
+                    model: r.get(7)?,
+                    decided_at: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +489,56 @@ mod tests {
         assert_eq!(remedy, "refresh_blockhash");
         assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.6"), "the serving model persists (ADR 0006)");
         assert_eq!(decided, 42);
+    }
+
+    /// Insert a minimal Submission under an explicit run_id (Day 11 prefix-scoping tests).
+    fn submit_under(s: &Store, run_id: &str, attempt: i64, submitted_at: i64) {
+        let nonce = format!("argus-{run_id}-jito-{attempt}");
+        s.record_submission(&NewSubmission {
+            run_id,
+            attempt,
+            nonce: &nonce,
+            bundle_id: None,
+            signature: "sig",
+            tip_lamports: 5000,
+            submitted_at,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn fetch_run_submissions_scopes_to_the_prefix_in_chronological_order() {
+        // ADR 0011: a Run is the prefix `run-{ts}`; its Payloads run under child
+        // run_ids `run-{ts}-p{k}`. The fetch must return exactly this Run's rows
+        // (LIKE `run-100-%`) and exclude a different Run that shares no prefix.
+        let s = store();
+        submit_under(&s, "run-100-p1", 1, 2_000); // out of order on purpose
+        submit_under(&s, "run-100-p0", 1, 1_000);
+        submit_under(&s, "run-100-p0", 2, 1_500);
+        submit_under(&s, "run-999-p0", 1, 9_000); // a DIFFERENT Run
+
+        let rows = s.fetch_run_submissions("run-100").unwrap();
+        assert_eq!(rows.len(), 3, "only the run-100 Payloads, never run-999");
+        // Chronological (serial-Run order), regardless of insert order or p-index string sort.
+        let order: Vec<i64> = rows.iter().map(|r| r.submitted_at).collect();
+        assert_eq!(order, vec![1_000, 1_500, 2_000]);
+        assert!(rows.iter().all(|r| r.run_id.starts_with("run-100-")));
+    }
+
+    #[test]
+    fn fetch_run_decisions_scopes_to_the_prefix() {
+        let s = store();
+        s.record_decision("run-100-p0", 1, FailureClass::ExpiredBlockhash, Remedy::RefreshBlockhash,
+            "r", Some(0.9), Some("trace"), Some("anthropic/x"), 1_000).unwrap();
+        s.record_decision("run-100-p2", 1, FailureClass::BundleFailure, Remedy::Abort,
+            "r", Some(0.8), None, Some("anthropic/x"), 2_000).unwrap();
+        s.record_decision("run-999-p0", 1, FailureClass::ComputeExceeded, Remedy::RaiseCuLimit,
+            "r", Some(0.7), None, Some("anthropic/x"), 9_000).unwrap();
+
+        let decs = s.fetch_run_decisions("run-100").unwrap();
+        assert_eq!(decs.len(), 2, "only the run-100 decisions");
+        assert_eq!(decs[0].run_id, "run-100-p0", "ordered by decided_at");
+        assert_eq!(decs[0].reasoning_trace.as_deref(), Some("trace"));
+        assert_eq!(decs[1].run_id, "run-100-p2");
     }
 }

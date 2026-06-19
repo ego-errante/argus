@@ -148,6 +148,20 @@ pub async fn get_slot(http_url: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("no slot in getSlot response: {resp}"))
 }
 
+/// Fetch an account's lamport balance (`getBalance` at confirmed). The Run preflight
+/// warns on a thin fee-payer before committing a full Run's worth of tips (ADR 0011).
+pub async fn get_balance(http_url: &str, pubkey: &str) -> Result<u64> {
+    let resp = rpc_call(
+        http_url,
+        "getBalance",
+        serde_json::json!([pubkey, { "commitment": "confirmed" }]),
+    )
+    .await?;
+    resp["result"]["value"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("no value in getBalance response: {resp}"))
+}
+
 /// Pure: extract the blockhash from a `getBlock` response, or `None` if the slot was
 /// skipped (`result: null`) — the caller then walks back to the previous slot.
 pub fn blockhash_from_block_response(resp: &serde_json::Value) -> Option<Hash> {

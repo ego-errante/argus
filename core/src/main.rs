@@ -7,6 +7,7 @@
 
 mod agent_client;
 mod config;
+mod export; // Day 11: Lifecycle Log render (Markdown two-part + JSONL) from SQLite
 mod model;
 mod storage;
 
@@ -70,6 +71,31 @@ async fn main() -> Result<()> {
     // both Yellowstone streams into SQLite (ADR 0004) — the Day 3-4 deliverable.
     if std::env::var("ARGUS_LIFECYCLE").is_ok() {
         return lifecycle_run(&cfg, &store).await;
+    }
+
+    // Standalone re-export (ARGUS_EXPORT=run-{ts}): regenerate a past Run's Lifecycle Log
+    // from SQLite (the source of truth) WITHOUT re-submitting — free iteration on the
+    // Markdown/JSONL formatting (ADR 0011). Checked before the keypair-bearing modes.
+    if let Ok(run_prefix) = std::env::var("ARGUS_EXPORT") {
+        let run_prefix = run_prefix.trim();
+        // Guard this manual path's raw user input: an empty prefix yields the degenerate
+        // LIKE `-%` (matches every Run → a mis-named `lifecycle-.md`), and `_`/`%` are SQL
+        // LIKE wildcards that would silently broaden the scope across unrelated Runs. The
+        // orchestrator's generated `run-{ts}` prefix is always safe; this only bites here.
+        if run_prefix.is_empty() || run_prefix.contains(['%', '_']) {
+            anyhow::bail!(
+                "ARGUS_EXPORT must be a concrete Run prefix like 'run-1718…' (no blanks, no SQL-LIKE wildcards %/_): got {run_prefix:?}"
+            );
+        }
+        let (jsonl, md) = export::write_lifecycle_log(&store, run_prefix, "logs")?;
+        info!(run = %run_prefix, %jsonl, %md, "EXPORT: Lifecycle Log re-rendered from SQLite");
+        return Ok(());
+    }
+
+    // The Run (ARGUS_RUN=1, ADR 0011): one orchestrated recording session — 3 injections +
+    // N clean Payloads under one Run prefix — that produces the graded Lifecycle Log.
+    if std::env::var("ARGUS_RUN").is_ok() {
+        return run_orchestrator(&cfg, &store).await;
     }
 
     // ---- The scored path (ADR 0007): construct + land a REAL Jito bundle. ----
@@ -425,6 +451,7 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
         };
         return injection_run(
             cfg, store, &payer, &run_id, base_tip, &regions, auth, &tip_accounts, injection, &policy,
+            false, // standalone ARGUS_INJECT stays sim-only (ADR 0010); only the Run sends the fault
         )
         .await;
     }
@@ -437,6 +464,120 @@ async fn lifecycle_run(cfg: &config::Config, store: &storage::Store) -> Result<(
         &failure::RetryState { tip_lamports: base_tip, cu_limit: None, priority_fee_microlamports: None },
     )
     .await?;
+    Ok(())
+}
+
+/// Warn below ~0.01 SOL before a Run — a full Run puts ~12 bundles on the wire (base fee
+/// 5000 lamports per accepted tx; tips paid only on the ~9 that land), well under this, so
+/// a payer below it risks running short.
+const RUN_MIN_BALANCE_LAMPORTS: u64 = 10_000_000;
+
+/// The Run (ARGUS_RUN=1, ADR 0011): a single-session orchestrator that drives the whole
+/// graded recording — the 3 deterministic injections, then `ARGUS_RUN_CLEAN_COUNT` clean
+/// Payloads — under ONE Run prefix (`run-{ts}`). Each Payload runs under a child run_id
+/// `run-{ts}-p{k}`, so the proven submit/track/persist path is reused verbatim (only the
+/// run_id varies — Run-ID-prefix keying). Serial, each Submission tracked to finalized;
+/// best-effort (one Payload's organic non-landing is recorded and the Run continues, no
+/// per-payload retry). Preflight hard-fails if the Agent `/health` is down (a scored Run
+/// must not degrade to local-fallback, ADR 0006); at the end it asserts ≥10 sent / ≥2
+/// failures and auto-exports the Lifecycle Log.
+async fn run_orchestrator(cfg: &config::Config, store: &storage::Store) -> Result<()> {
+    // A Run is a scored artifact — it MUST reason via the Agent, never the local stand-in.
+    if !cfg.use_agent {
+        anyhow::bail!(
+            "ARGUS_RUN requires ARGUS_POLICY=agent — a scored Run must not run on the local stand-in (ADR 0006)"
+        );
+    }
+
+    // Preflight: keypair is fatal; Agent /health is a hard gate; balance only warns.
+    let payer = wallet::load_keypair(&cfg.keypair_path)?;
+    info!(payer = %payer.pubkey(), "RUN: loaded fee-payer keypair");
+    let agent = agent_client::AgentClient::new(&cfg.agent_url, cfg.agent_timeout_secs)?;
+    agent.health().await.map_err(|e| {
+        anyhow::anyhow!(
+            "RUN preflight: Agent /health unreachable at {} ({e}) — refusing to start a scored Run (ADR 0011)",
+            cfg.agent_url
+        )
+    })?;
+    info!(agent_url = %cfg.agent_url, "RUN: Agent /health OK");
+    let policy = failure::Policy::Agent(agent);
+
+    match rpc::get_balance(&cfg.rpc_http_url, &payer.pubkey().to_string()).await {
+        Ok(lamports) => {
+            let balance_sol = lamports as f64 / 1_000_000_000.0;
+            if lamports < RUN_MIN_BALANCE_LAMPORTS {
+                warn!(payer = %payer.pubkey(), balance_sol, "RUN: thin fee-payer balance — a full Run may run short");
+            } else {
+                info!(payer = %payer.pubkey(), balance_sol, "RUN: fee-payer balance OK");
+            }
+        }
+        Err(e) => warn!(error = %e, "RUN: balance check failed (continuing best-effort)"),
+    }
+
+    let base_tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, cfg.jito_tip_percentile).await?;
+    let regions = bundle::regional_endpoints();
+    let auth = cfg.jito_auth_uuid.as_deref();
+    let tip_accounts = bundle::published_tip_accounts();
+
+    // The Run prefix; each Payload runs under a child run_id `run-{ts}-p{k}` (ADR 0011).
+    let run_prefix = format!("run-{}", now_millis());
+    let injections = [
+        failure::Injection::ExpiredBlockhash,
+        failure::Injection::ComputeExceeded,
+        failure::Injection::BundleFailure,
+    ];
+    let total = injections.len() + cfg.run_clean_count;
+    info!(%run_prefix, injections = injections.len(), clean = cfg.run_clean_count, total,
+        "RUN: starting (serial, each Submission tracked to finalized)");
+
+    let mut k = 0usize;
+
+    // The 3 injections first: each sends a faulted attempt-1, classifies, Agent-decides,
+    // then applies the Remedy (attempt-2 for the recoverables; Abort for bundle_failure).
+    for injection in injections {
+        let run_id = format!("{run_prefix}-p{k}");
+        info!(%run_id, ?injection, "RUN: injection Payload {}/{}", k + 1, total);
+        if let Err(e) = injection_run(
+            cfg, store, &payer, &run_id, base_tip, &regions, auth, &tip_accounts, injection, &policy,
+            true, // the Run sends the faulted attempt-1 on the wire (ADR 0011)
+        )
+        .await
+        {
+            warn!(%run_id, ?injection, error = %format!("{e:#}"), "RUN: injection Payload errored — continuing best-effort");
+        }
+        k += 1;
+    }
+
+    // Then the clean Payloads — one Submission each, tracked to finalized.
+    for _ in 0..cfg.run_clean_count {
+        let run_id = format!("{run_prefix}-p{k}");
+        info!(%run_id, "RUN: clean Payload {}/{}", k + 1, total);
+        let seed = failure::RetryState { tip_lamports: base_tip, cu_limit: None, priority_fee_microlamports: None };
+        let ctx = SubmitCtx { cfg, store, payer: &payer, run_id: &run_id, regions: &regions, auth };
+        if let Err(e) = submit_and_track_one(&ctx, 1, tip_accounts[k % tip_accounts.len()], &seed).await {
+            warn!(%run_id, error = %format!("{e:#}"), "RUN: clean Payload errored — continuing best-effort");
+        }
+        k += 1;
+    }
+
+    // End-of-Run: assert the graded bar BEFORE assembling the Lifecycle Log (ADR 0011), so
+    // a deficient Run is caught loudly here, not at submission time.
+    let subs = store.fetch_run_submissions(&run_prefix)?;
+    let (sent, failures, landed) = export::run_counts(&subs);
+    info!(%run_prefix, sent, failures, landed, "RUN: complete");
+    if sent < 10 {
+        warn!(sent, "RUN: ⚠ fewer than 10 real bundle Submissions — Lifecycle Log is short of the bar");
+    }
+    if failures < 2 {
+        warn!(failures, "RUN: ⚠ fewer than 2 classified Failures — Lifecycle Log lacks the required failure evidence");
+    }
+    if sent >= 10 && failures >= 2 {
+        info!(sent, failures, "RUN: ✅ meets the graded bar (≥10 Submissions, ≥2 Failures)");
+    }
+
+    // Auto-export the Lifecycle Log (JSONL + Markdown) for this Run.
+    let (jsonl, md) = export::write_lifecycle_log(store, &run_prefix, "logs")?;
+    info!(%run_prefix, %jsonl, %md, "RUN: Lifecycle Log exported");
     Ok(())
 }
 
@@ -687,11 +828,14 @@ async fn observe_cu_need(
         .ok_or_else(|| anyhow::anyhow!("max-CU re-sim returned no unitsConsumed: err={:?}", sim.err))
 }
 
-/// Faulted lifecycle run (ARGUS_INJECT, ADR 0010): build an attempt-1 bundle carrying
-/// one deterministic fault, classify it via preflight simulation (the only reason
-/// source for an all-or-nothing bundle), let the local policy (Agent stand-in) choose
-/// a Remedy, persist the Failure Class + decision, then execute the Remedy — Abort
-/// stops; otherwise attempt 2 resubmits clean and is tracked to finalize.
+/// Faulted lifecycle run (ARGUS_INJECT, ADR 0010 + 0011): build an attempt-1 bundle
+/// carrying one deterministic fault; for the Run (`send_faulted`) SEND it on the wire (a
+/// real, non-landing, free Submission — ADR 0011), the standalone `ARGUS_INJECT` path
+/// passes `false` and stays sim-only (its ADR 0010 behavior). Classify it via preflight
+/// simulation (the only reason source for an all-or-nothing bundle), let the Policy (Agent
+/// over HTTP, or the local stand-in) choose a Remedy, persist the Failure Class + decision,
+/// then execute the Remedy — Abort stops; otherwise attempt 2 resubmits clean and is
+/// tracked to finalize.
 #[allow(clippy::too_many_arguments)]
 async fn injection_run(
     cfg: &config::Config,
@@ -704,6 +848,7 @@ async fn injection_run(
     tip_accounts: &[solana_sdk::pubkey::Pubkey],
     injection: failure::Injection,
     policy: &failure::Policy,
+    send_faulted: bool,
 ) -> Result<()> {
     use failure::{Injection, RetryState};
     use solana_sdk::signer::Signer;
@@ -755,7 +900,27 @@ async fn injection_run(
         tip_lamports: base_tip,
         submitted_at: now_millis() as i64,
     })?;
-    info!(?injection, %signature, %explorer, "INJECT: built faulted bundle — simulating to classify");
+    info!(?injection, %signature, %explorer, "INJECT: built faulted bundle");
+
+    // 1b) For the Run (`send_faulted`), SEND the faulted attempt-1 on the wire (ADR 0011,
+    // amending ADR 0010's sim-only stance). A doomed bundle never lands, so it pays no tip —
+    // it is a REAL, non-landing Submission that counts toward the Run's "≥10 real bundle
+    // submissions" and is genuine ≥2-failure evidence. Send-and-record, NOT track-to-finalize:
+    // it emits no Landed event, so a finalize stream would only burn the ADR 0009 ceiling. The
+    // standalone `ARGUS_INJECT` path passes `false` and stays sim-only (its ADR 0010 behavior).
+    // Non-landing is authoritative from the absent `landed_slot` — no inflight poll needed. The
+    // preflight simulation below stays the *classification* source either way (an all-or-nothing
+    // bundle leaves no on-chain meta — ADR 0010's core reason still holds).
+    if send_faulted {
+        let send_results = bundle::submit_all_regions(regions, &txs, auth).await;
+        let accepted = send_results.iter().filter(|(_, r)| r.is_ok()).count();
+        if let Some(bid) = send_results.iter().find_map(|(_, r)| r.as_ref().ok().cloned()) {
+            let _ = store.set_bundle_id(run_id, attempt, &nonce, &bid);
+            info!(accepted, total = send_results.len(), bundle_id = %bid, %explorer, "INJECT: faulted bundle sent (non-landing, free) — recorded");
+        } else {
+            warn!(accepted, "INJECT: no region accepted the faulted bundle — still recorded as a non-landing Submission");
+        }
+    }
 
     // 2) Classify via preflight simulation (the deterministic reason source).
     let sim = rpc::simulate_transaction(&cfg.rpc_http_url, &txs[0]).await?;

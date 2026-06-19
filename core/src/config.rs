@@ -48,6 +48,10 @@ pub struct Config {
     /// Bound on the Agent decide round-trip (ARGUS_AGENT_TIMEOUT_SECS). Generous by
     /// default — a reasoning completion is slow; a dead Agent trips this into a fallback.
     pub agent_timeout_secs: u64,
+    /// Clean Payloads the Run submits after the 3 deterministic injections
+    /// (ARGUS_RUN_CLEAN_COUNT, ADR 0011). Default 7 → 3 injections + 7 clean = 12
+    /// Submissions, clearing the "≥10 real bundle submissions" bar with margin.
+    pub run_clean_count: usize,
     pub db_path: String,
 }
 
@@ -187,6 +191,10 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8787/decide".into()),
             use_agent: parse_use_agent(std::env::var("ARGUS_POLICY").ok().as_deref()),
             agent_timeout_secs: env_num_positive("ARGUS_AGENT_TIMEOUT_SECS", 45u64),
+            // env_num (not _positive): 0 clean Payloads is a legitimate (if deficient)
+            // choice — the end-of-Run assertion catches a Run that falls short, rather
+            // than this silently rewriting a deliberate 0 back to the default.
+            run_clean_count: env_num("ARGUS_RUN_CLEAN_COUNT", 7usize),
             db_path: std::env::var("ARGUS_DB_PATH").unwrap_or_else(|_| "logs/argus.db".into()),
         };
 

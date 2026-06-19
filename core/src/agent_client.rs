@@ -62,6 +62,23 @@ impl AgentClient {
         })
     }
 
+    /// Liveness probe for the Run's preflight (ADR 0011). A scored Run must NOT silently
+    /// degrade to `local-fallback` (ADR 0006), so the orchestrator refuses to start if the
+    /// Agent's `/health` doesn't answer 2xx. Derives the health URL from the decide URL
+    /// (same host, sibling path) so there's one configured endpoint.
+    pub async fn health(&self) -> Result<()> {
+        let health_url = match self.url.rsplit_once('/') {
+            Some((base, _)) => format!("{base}/health"),
+            None => format!("{}/health", self.url),
+        };
+        self.http
+            .get(&health_url)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     pub async fn decide(&self, ctx: &FailureContext<'_>) -> Result<Decision> {
         let resp = self
             .http
