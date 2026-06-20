@@ -1,7 +1,7 @@
 //! SQLite source of truth for the Lifecycle Log (ADR 0004 / PLAN.md).
 //! JSONL + the Markdown table are exported from this (Day 11).
 
-use crate::model::{FailureClass, Remedy};
+use crate::model::{FailureClass, Remedy, Triage};
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
@@ -125,8 +125,19 @@ pub struct SubmissionRow {
 pub struct DecisionRow {
     pub run_id: String,
     pub attempt: i64,
+    /// The Core's four-class BASELINE verdict (ADR 0012) — kept for the agent-vs-baseline
+    /// contrast in the Lifecycle Log, no longer the Agent's input.
     pub failure_class: String,
+    /// The Agent's chosen action.
     pub remedy: String,
+    /// What the baseline would have done (`default_remedy(failure_class)`) — the action column
+    /// the Agent's `remedy` is measured against (ADR 0012).
+    pub baseline_remedy: Option<String>,
+    /// The Agent's plain-language cause, decoded from the raw failure surface (ADR 0012).
+    /// `None` on the local paths (the stand-in / fallback carry no Diagnosis).
+    pub diagnosis: Option<String>,
+    /// The Agent's recovery bucket (ADR 0012). `None` on the local paths.
+    pub triage: Option<String>,
     pub rationale: String,
     pub confidence: Option<f64>,
     pub reasoning_trace: Option<String>,
@@ -153,12 +164,16 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(sql)?;
         // Idempotent column guard for DBs created before a column existed: `CREATE TABLE
-        // IF NOT EXISTS` skips an existing table, so a newly-added column (here
-        // `decisions.model`, the ADR 0006 provenance field) would be missing on an old
-        // argus.db and every 9-column INSERT would fail `no such column: model`. This adds
-        // ONLY the missing column — a one-column guard, not a versioned migration framework
-        // (the Q4 grilling decision). Fresh DBs already have it from the CREATE above.
+        // IF NOT EXISTS` skips an existing table, so a newly-added column would be missing on
+        // an old argus.db and the INSERT would fail `no such column: ...`. Each adds ONLY the
+        // missing column — a per-column guard, not a versioned migration framework (the Q4
+        // grilling decision). Fresh DBs already have these from the CREATE above.
+        //   - `model`: the ADR 0006 provenance field.
+        //   - `baseline_remedy`/`diagnosis`/`triage`: the ADR 0012 agent-vs-baseline columns.
         ensure_column(&conn, "decisions", "model", "TEXT")?;
+        ensure_column(&conn, "decisions", "baseline_remedy", "TEXT")?;
+        ensure_column(&conn, "decisions", "diagnosis", "TEXT")?;
+        ensure_column(&conn, "decisions", "triage", "TEXT")?;
         Ok(())
     }
 
@@ -261,8 +276,11 @@ impl Store {
     }
 
     /// Record a Remedy decision + its Reasoning Trace into the `decisions` table.
-    /// Day 7-8 writes the local default policy's decision here; Day 9-10 swaps the
-    /// source to the Agent without changing this sink.
+    /// `class` is the four-class BASELINE verdict and `baseline_remedy` what that baseline
+    /// would do — both stored for the agent-vs-baseline contrast, not as the Agent's input
+    /// (ADR 0012). `diagnosis`/`triage` are the Agent's reasoned output (`None` on the local
+    /// paths). A dumb sink: policy semantics (what the baseline remedy IS) are computed by the
+    /// caller, where `default_remedy` is in scope.
     #[allow(clippy::too_many_arguments)]
     pub fn record_decision(
         &self,
@@ -270,6 +288,9 @@ impl Store {
         attempt: i64,
         class: FailureClass,
         remedy: Remedy,
+        baseline_remedy: Remedy,
+        diagnosis: Option<&str>,
+        triage: Option<Triage>,
         rationale: &str,
         confidence: Option<f64>,
         reasoning_trace: Option<&str>,
@@ -277,13 +298,16 @@ impl Store {
         decided_at: i64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, rationale, confidence, reasoning_trace, model, decided_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, baseline_remedy, diagnosis, triage, rationale, confidence, reasoning_trace, model, decided_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 run_id,
                 attempt,
                 enum_token(class),
                 enum_token(remedy),
+                enum_token(baseline_remedy),
+                diagnosis,
+                triage.map(enum_token),
                 rationale,
                 confidence,
                 reasoning_trace,
@@ -319,8 +343,8 @@ impl Store {
         let like = format!("{run_prefix}-%");
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT run_id, attempt, failure_class, remedy, rationale, confidence, \
-             reasoning_trace, model, decided_at \
+            "SELECT run_id, attempt, failure_class, remedy, baseline_remedy, diagnosis, triage, \
+             rationale, confidence, reasoning_trace, model, decided_at \
              FROM decisions WHERE run_id LIKE ?1 ORDER BY decided_at, attempt",
         )?;
         let rows = stmt
@@ -330,11 +354,14 @@ impl Store {
                     attempt: r.get(1)?,
                     failure_class: r.get(2)?,
                     remedy: r.get(3)?,
-                    rationale: r.get(4)?,
-                    confidence: r.get(5)?,
-                    reasoning_trace: r.get(6)?,
-                    model: r.get(7)?,
-                    decided_at: r.get(8)?,
+                    baseline_remedy: r.get(4)?,
+                    diagnosis: r.get(5)?,
+                    triage: r.get(6)?,
+                    rationale: r.get(7)?,
+                    confidence: r.get(8)?,
+                    reasoning_trace: r.get(9)?,
+                    model: r.get(10)?,
+                    decided_at: r.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -462,31 +489,98 @@ mod tests {
     }
 
     #[test]
-    fn record_decision_round_trips() {
+    fn ensure_column_adds_the_adr0012_columns_to_an_old_db() {
+        // An argus.db created before ADR 0012: a decisions table WITH `model` but none of the
+        // agent-vs-baseline columns (baseline_remedy/diagnosis/triage) — exactly what
+        // CREATE TABLE IF NOT EXISTS skips on an existing table.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE decisions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          TEXT    NOT NULL,
+                attempt         INTEGER NOT NULL,
+                failure_class   TEXT    NOT NULL,
+                remedy          TEXT    NOT NULL,
+                rationale       TEXT    NOT NULL,
+                confidence      REAL,
+                reasoning_trace TEXT,
+                model           TEXT,
+                decided_at      INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // The guards add the three missing columns (each idempotent — safe on every startup).
+        for col in ["baseline_remedy", "diagnosis", "triage"] {
+            ensure_column(&conn, "decisions", col, "TEXT").unwrap();
+            ensure_column(&conn, "decisions", col, "TEXT").unwrap(); // twice = no-op
+        }
+        // ...so the full 12-column INSERT the new record_decision uses now succeeds on the old DB.
+        conn.execute(
+            "INSERT INTO decisions (run_id, attempt, failure_class, remedy, baseline_remedy, diagnosis, triage, rationale, confidence, reasoning_trace, model, decided_at)
+             VALUES ('run-old', 1, 'bundle_failure', 'raise_cu_limit', 'abort', 'd', 'recoverable_by_modification', 'r', 0.9, NULL, 'anthropic/x', 7)",
+            [],
+        )
+        .unwrap();
+
+        let (baseline, triage): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT baseline_remedy, triage FROM decisions WHERE run_id = 'run-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(baseline.as_deref(), Some("abort"), "the upgraded baseline_remedy round-trips");
+        assert_eq!(triage.as_deref(), Some("recoverable_by_modification"), "the upgraded triage round-trips");
+    }
+
+    #[test]
+    fn record_decision_round_trips_with_diagnosis_and_baseline_contrast() {
         let s = store();
+        // An Agent decision (ADR 0012): the baseline would Abort the bundle_failure, but the
+        // Agent diagnosed a recoverable case and chose a DIFFERENT remedy. Both the chosen
+        // action and the baseline contrast persist, alongside the diagnosis + triage.
         s.record_decision(
             "run-1",
             1,
-            FailureClass::ExpiredBlockhash,
-            Remedy::RefreshBlockhash,
-            "local default policy",
-            Some(1.0),
-            None,
+            FailureClass::BundleFailure,  // the four-class baseline verdict
+            Remedy::RaiseCuLimit,         // the Agent's chosen action
+            // What the baseline would have done — derived from the real policy (not a literal),
+            // so a divergence in default_remedy is caught by the `Some("abort")` assertion below.
+            crate::failure::default_remedy(FailureClass::BundleFailure),
+            Some("Orca Whirlpool rejected ix 2 with Custom(101) — InstructionFallbackNotFound."),
+            Some(Triage::RecoverableByModification),
+            "diagnosis implies a modified retry can land",
+            Some(0.97),
+            Some("weighed abort vs modify"),
             Some("anthropic/claude-sonnet-4.6"),
             42,
         )
         .unwrap();
         // The test lives in the storage module, so it can read the private conn.
         let conn = s.conn.lock().unwrap();
-        let (class, remedy, model, decided): (String, String, Option<String>, i64) = conn
+        #[allow(clippy::type_complexity)]
+        let (class, remedy, baseline, diagnosis, triage, model, decided): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = conn
             .query_row(
-                "SELECT failure_class, remedy, model, decided_at FROM decisions WHERE run_id = ?1 AND attempt = ?2",
+                "SELECT failure_class, remedy, baseline_remedy, diagnosis, triage, model, decided_at \
+                 FROM decisions WHERE run_id = ?1 AND attempt = ?2",
                 params!["run-1", 1],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
             .unwrap();
-        assert_eq!(class, "expired_blockhash");
-        assert_eq!(remedy, "refresh_blockhash");
+        assert_eq!(class, "bundle_failure", "the baseline class persists for contrast");
+        assert_eq!(remedy, "raise_cu_limit", "the Agent's chosen remedy");
+        assert_eq!(baseline.as_deref(), Some("abort"), "what the baseline would have done");
+        assert!(diagnosis.unwrap().contains("InstructionFallbackNotFound"), "the Agent's plain-language cause");
+        assert_eq!(triage.as_deref(), Some("recoverable_by_modification"), "the Agent's recovery bucket (ADR 0012)");
         assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.6"), "the serving model persists (ADR 0006)");
         assert_eq!(decided, 42);
     }
@@ -529,16 +623,22 @@ mod tests {
     fn fetch_run_decisions_scopes_to_the_prefix() {
         let s = store();
         s.record_decision("run-100-p0", 1, FailureClass::ExpiredBlockhash, Remedy::RefreshBlockhash,
+            Remedy::RefreshBlockhash, Some("stale blockhash"), Some(Triage::RecoverableByRefresh),
             "r", Some(0.9), Some("trace"), Some("anthropic/x"), 1_000).unwrap();
         s.record_decision("run-100-p2", 1, FailureClass::BundleFailure, Remedy::Abort,
-            "r", Some(0.8), None, Some("anthropic/x"), 2_000).unwrap();
+            Remedy::Abort, None, None, "r", Some(0.8), None, Some("anthropic/x"), 2_000).unwrap();
         s.record_decision("run-999-p0", 1, FailureClass::ComputeExceeded, Remedy::RaiseCuLimit,
-            "r", Some(0.7), None, Some("anthropic/x"), 9_000).unwrap();
+            Remedy::RaiseCuLimit, None, None, "r", Some(0.7), None, Some("anthropic/x"), 9_000).unwrap();
 
         let decs = s.fetch_run_decisions("run-100").unwrap();
         assert_eq!(decs.len(), 2, "only the run-100 decisions");
         assert_eq!(decs[0].run_id, "run-100-p0", "ordered by decided_at");
         assert_eq!(decs[0].reasoning_trace.as_deref(), Some("trace"));
+        // The ADR 0012 columns survive the read path the export renders from.
+        assert_eq!(decs[0].baseline_remedy.as_deref(), Some("refresh_blockhash"));
+        assert_eq!(decs[0].diagnosis.as_deref(), Some("stale blockhash"));
+        assert_eq!(decs[0].triage.as_deref(), Some("recoverable_by_refresh"));
+        assert_eq!(decs[1].triage, None, "a local-shaped decision carries no triage");
         assert_eq!(decs[1].run_id, "run-100-p2");
     }
 }

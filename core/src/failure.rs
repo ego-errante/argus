@@ -10,9 +10,9 @@
 use crate::agent_client::{AgentClient, Decision, FailureContext};
 use crate::model::{FailureClass, Remedy};
 use crate::rpc::SimResult;
-use anyhow::Result;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 use tracing::warn;
 
 /// How far back to age the injected blockhash. Blockhashes are valid ~150 slots, so
@@ -40,24 +40,94 @@ const TIP_BUMP_DENOMINATOR: u64 = 2;
 pub const MODEL_LOCAL: &str = "local";
 pub const MODEL_LOCAL_FALLBACK: &str = "local-fallback";
 
-/// A deterministic fault to inject. Mirrors the three deterministic `FailureClass`
+/// A deterministic fault to inject. The first three mirror the deterministic `FailureClass`
 /// causes; `FeeTooLow` is probabilistic (landing-contention) and not injectable here.
+/// `ForeignProgram(fault)` (ADR 0012) is a real foreign-program rejection — the unbounded,
+/// unstructured failure surface the Agent diagnoses where the four-class baseline blind-aborts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Injection {
     ExpiredBlockhash,
     ComputeExceeded,
     BundleFailure,
+    ForeignProgram(ForeignFault),
+}
+
+/// Which foreign program to provoke (ADR 0012). Each rejects the SAME uniform 8-byte garbage
+/// instruction with a DISTINCT, program-specific error — the unbounded surface the Agent decodes
+/// where the four-class baseline collapses all of them to one blind `BundleFailure`. All three
+/// proven to reproduce on the preflight-sim path (2026-06-20, zero SOL):
+///   - `Memo`  → `InvalidInstructionData` ("Invalid UTF-8, from byte 0") — a non-Custom native error.
+///   - `Token` → `Custom(12)` (SPL-Token `InvalidInstruction`).
+///   - `Whirlpool` → `Custom(101)` (Anchor `InstructionFallbackNotFound`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignFault {
+    Memo,
+    Token,
+    Whirlpool,
+}
+
+impl ForeignFault {
+    /// The on-chain program ID this fault targets.
+    pub fn program_id(self) -> &'static str {
+        match self {
+            ForeignFault::Memo => MEMO_PROGRAM_ID,
+            ForeignFault::Token => TOKEN_PROGRAM_ID,
+            ForeignFault::Whirlpool => WHIRLPOOL_PROGRAM_ID,
+        }
+    }
 }
 
 /// Parse `ARGUS_INJECT` into an optional `Injection`. snake_case to match the
-/// `FailureClass` wire strings; blank/unknown -> `None` (no injection).
+/// `FailureClass` wire strings; blank/unknown -> `None` (no injection). The foreign faults are
+/// individually triggerable (`foreign_memo`/`foreign_token`/`foreign_whirlpool`); `foreign_program`
+/// stays an alias for the Whirlpool fault (the slice-1 tracer + ADR 0012 examples).
 pub fn parse_injection(raw: Option<&str>) -> Option<Injection> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("expired_blockhash") => Some(Injection::ExpiredBlockhash),
         Some("compute_exceeded") => Some(Injection::ComputeExceeded),
         Some("bundle_failure") => Some(Injection::BundleFailure),
+        Some("foreign_memo") => Some(Injection::ForeignProgram(ForeignFault::Memo)),
+        Some("foreign_token") => Some(Injection::ForeignProgram(ForeignFault::Token)),
+        Some("foreign_whirlpool") | Some("foreign_program") => {
+            Some(Injection::ForeignProgram(ForeignFault::Whirlpool))
+        }
         _ => None,
     }
+}
+
+/// SPL Memo — rejects non-UTF-8 instruction data with `InvalidInstructionData` (ADR 0012).
+pub const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+/// SPL Token — rejects an unknown instruction tag with `Custom(12)` (`InvalidInstruction`).
+pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// Orca Whirlpool — a widely-deployed Anchor program; a bad discriminator makes it reject with
+/// `Custom(101)` (`InstructionFallbackNotFound`) plus a self-describing AnchorError log.
+pub const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+
+/// The foreign-program fault payload (ADR 0012): the default payload (self-transfer + Memo
+/// nonce) plus a single instruction to `fault`'s program carrying a uniform invalid 8-byte
+/// payload and NO accounts. Each target program rejects this BEFORE touching accounts, with a
+/// distinct program-specific error + self-describing log — an UNBOUNDED failure the four-class
+/// baseline collapses to a blind abort. Pure; tested via `build_bundle_with_payload`.
+pub fn foreign_fault_payload(fault: ForeignFault, payer: &Pubkey, nonce: &str) -> Vec<Instruction> {
+    let mut payload = crate::bundle::default_payload(payer, nonce, 1);
+    let program = Pubkey::from_str(fault.program_id()).expect("valid foreign program id");
+    payload.push(Instruction::new_with_bytes(program, &[0xff; 8], Vec::new()));
+    payload
+}
+
+/// Extract the program ID that rejected the transaction from the simulation logs — the
+/// `Program <ID> failed: ...` line. Part of the raw failure surface the Agent decodes a
+/// program-specific error against (ADR 0012). Returns the first failing program (the
+/// originator of the error), or `None` when no failed-program line is present.
+pub fn failing_program_id(logs: &[String]) -> Option<String> {
+    logs.iter().find_map(|line| {
+        let rest = line.strip_prefix("Program ")?;
+        if !rest.contains(" failed:") {
+            return None; // "Program log:" / "invoke" / "consumed" lines also start with "Program "
+        }
+        let id = rest.split(" failed:").next()?;
+        (!id.is_empty() && !id.contains(' ')).then(|| id.to_string())
+    })
 }
 
 /// Map a preflight `SimResult` to a `FailureClass` — the central testable unit.
@@ -202,18 +272,19 @@ pub enum Policy {
 }
 
 impl Policy {
-    /// Decide a Remedy. The Agent arm NEVER propagates a transport error: on any
-    /// failure (unreachable, timeout, 5xx, bad body) it warns loudly and returns the
-    /// local fallback decision, marked `local-fallback`, so a transient Agent hiccup
-    /// can't kill an in-progress Run yet the provenance never lies (ADR 0006/0008).
-    pub async fn decide(&self, ctx: &FailureContext<'_>) -> Result<Decision> {
+    /// Decide a Remedy. Infallible by construction: the Agent arm NEVER propagates a transport
+    /// error — on any failure (unreachable, timeout, 5xx, bad body) it warns loudly and returns
+    /// the local fallback decision, marked `local-fallback`, so a transient Agent hiccup can't
+    /// kill an in-progress Run yet the provenance never lies (ADR 0006/0008). Returns `Decision`
+    /// (not `Result`) so the call site can't pretend a recoverable hiccup is fatal.
+    pub async fn decide(&self, ctx: &FailureContext<'_>) -> Decision {
         match self {
-            Policy::Local => Ok(local_decision(ctx.failure_class)),
+            Policy::Local => local_decision(ctx.failure_class),
             Policy::Agent(client) => match client.decide(ctx).await {
-                Ok(d) => Ok(d),
+                Ok(d) => d,
                 Err(e) => {
                     warn!(error = %e, "agent decide failed — falling back to local default policy (recorded)");
-                    Ok(fallback_decision(ctx.failure_class, &e.to_string()))
+                    fallback_decision(ctx.failure_class, &e.to_string())
                 }
             },
         }
@@ -229,6 +300,10 @@ fn local_like(class: FailureClass, model: &str, rationale: String) -> Decision {
         remedy: default_remedy(class),
         rationale,
         confidence: 1.0,
+        // The local paths carry no Diagnosis/Triage (the Agent's reasoned output); like the
+        // absent Reasoning Trace, this keeps them out of scored evidence (ADR 0006/0012).
+        diagnosis: None,
+        triage: None,
         reasoning_trace: None,
         model: Some(model.to_string()),
     }
@@ -287,9 +362,56 @@ mod tests {
         assert_eq!(parse_injection(Some("expired_blockhash")), Some(Injection::ExpiredBlockhash));
         assert_eq!(parse_injection(Some(" Compute_Exceeded ")), Some(Injection::ComputeExceeded));
         assert_eq!(parse_injection(Some("bundle_failure")), Some(Injection::BundleFailure));
+        // The foreign-program spread is individually triggerable; `foreign_program` aliases Whirlpool.
+        assert_eq!(parse_injection(Some("foreign_memo")), Some(Injection::ForeignProgram(ForeignFault::Memo)));
+        assert_eq!(parse_injection(Some("foreign_token")), Some(Injection::ForeignProgram(ForeignFault::Token)));
+        assert_eq!(parse_injection(Some("foreign_whirlpool")), Some(Injection::ForeignProgram(ForeignFault::Whirlpool)));
+        assert_eq!(parse_injection(Some("foreign_program")), Some(Injection::ForeignProgram(ForeignFault::Whirlpool)));
         assert_eq!(parse_injection(None), None);
         assert_eq!(parse_injection(Some("")), None);
         assert_eq!(parse_injection(Some("nonsense")), None);
+    }
+
+    #[test]
+    fn foreign_fault_payload_targets_the_selected_program() {
+        // Each fault appends a single instruction to ITS program, carrying the uniform 8-byte
+        // garbage payload and no accounts — the shape proven to reject distinctly on the sim path.
+        let payer = Pubkey::new_unique();
+        for (fault, pid) in [
+            (ForeignFault::Memo, MEMO_PROGRAM_ID),
+            (ForeignFault::Token, TOKEN_PROGRAM_ID),
+            (ForeignFault::Whirlpool, WHIRLPOOL_PROGRAM_ID),
+        ] {
+            assert_eq!(fault.program_id(), pid, "program_id maps to the right program");
+            let payload = foreign_fault_payload(fault, &payer, "argus-run-1-jito-1");
+            let last = payload.last().expect("a fault instruction is appended");
+            assert_eq!(last.program_id, Pubkey::from_str(pid).unwrap(), "the fault targets {pid}");
+            assert_eq!(last.data, vec![0xff; 8], "uniform 8-byte garbage payload");
+            assert!(last.accounts.is_empty(), "no accounts — rejected before account access");
+        }
+    }
+
+    #[test]
+    fn failing_program_id_extracts_the_rejecting_program() {
+        // The exact log shape a foreign-program rejection produces (proven live 2026-06-20):
+        // only the `Program <ID> failed:` line carries the originating program — the invoke/
+        // log/consumed lines also start with "Program " and must NOT match.
+        let logs = vec![
+            "Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc invoke [1]".to_string(),
+            "Program log: AnchorError occurred. Error Code: InstructionFallbackNotFound.".to_string(),
+            "Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc consumed 1427 of 200000 compute units".to_string(),
+            "Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc failed: custom program error: 0x65".to_string(),
+        ];
+        assert_eq!(
+            failing_program_id(&logs).as_deref(),
+            Some("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")
+        );
+        assert_eq!(failing_program_id(&[]), None, "no logs -> None");
+        assert_eq!(
+            failing_program_id(&["Program log: success".to_string()]).as_deref(),
+            None,
+            "no failed-program line -> None"
+        );
     }
 
     #[test]

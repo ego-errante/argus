@@ -94,6 +94,28 @@ fn sig_cell(sig: Option<&str>) -> String {
     }
 }
 
+/// The baseline cell (ADR 0012): the four-class verdict and the action it implies
+/// (`class → remedy`), flagged with ⚠ when the verdict is the catch-all `bundle_failure` — the
+/// bucket the Agent's Diagnosis exists to disambiguate (distinct real failures the baseline
+/// can't tell apart, e.g. a funding shortfall vs. three different malformed foreign calls).
+fn baseline_cell(class: &str, baseline_remedy: Option<&str>) -> String {
+    let remedy = baseline_remedy.unwrap_or("—");
+    // The catch-all's wire token, tied to the enum (model::CATCH_ALL_CLASS_TOKEN) rather than a
+    // bare literal — a rename of the `BundleFailure` serde token breaks model.rs's test, not this
+    // marker silently (the altitude fix from the ADR 0012 review).
+    let blind = if class == crate::model::CATCH_ALL_CLASS_TOKEN { " ⚠" } else { "" };
+    format!("{} → {}{}", cell(class), cell(remedy), blind)
+}
+
+/// The agent cell (ADR 0012): `triage → remedy` — the Agent's recovery bucket and the action it
+/// chose. Falls back to just the remedy on the local paths, which carry no Triage.
+fn agent_cell(triage: Option<&str>, remedy: &str) -> String {
+    match triage {
+        Some(t) => format!("{} → {}", cell(t), cell(remedy)),
+        None => cell(remedy),
+    }
+}
+
 /// (sent, failures, landed) over a Run's Submissions — the end-of-Run assertion inputs
 /// (ADR 0011: ≥10 sent, ≥2 failures). Every recorded Submission is now sent on the wire
 /// (the faulted attempt-1 included); a Failure is one carrying a classified Failure Class.
@@ -137,25 +159,32 @@ pub fn render_markdown(run_prefix: &str, subs: &[SubmissionRow], decs: &[Decisio
         ));
     }
 
-    out.push_str("\n## Agent Decisions\n\n");
+    out.push_str("\n## Agent Decisions — Diagnosis vs. the four-class baseline\n\n");
     if decs.is_empty() {
         out.push_str("_No Agent decisions recorded for this Run._\n");
         return out;
     }
     out.push_str(
-        "| Payload | Failure | Remedy | Confidence | Model | Rationale | Reasoning (excerpt) |\n\
-         |---------|---------|--------|------------|-------|-----------|---------------------|\n",
+        "_The Agent reasons from the raw failure surface (the failing program, its structured error, \
+         and its logs), NOT the baseline class (ADR 0012). ⚠ marks the catch-all `bundle_failure` the \
+         baseline assigns to distinct failures the Agent tells apart — compare the Diagnosis column. \
+         Full Reasoning Traces are in the JSONL._\n\n",
+    );
+    out.push_str(
+        "| Payload | Baseline (class → remedy) | Agent (triage → remedy) | Diagnosis (excerpt) | Rationale (excerpt) | Conf | Model | Reasoning (excerpt) |\n\
+         |---------|---------------------------|-------------------------|---------------------|---------------------|------|-------|---------------------|\n",
     );
     for d in decs {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             payload_label(&d.run_id, run_prefix),
-            cell(&d.failure_class),
-            cell(&d.remedy),
+            baseline_cell(&d.failure_class, d.baseline_remedy.as_deref()),
+            agent_cell(d.triage.as_deref(), &d.remedy),
+            d.diagnosis.as_deref().map(|t| excerpt(t, 90)).unwrap_or_else(|| "—".to_string()),
+            excerpt(&d.rationale, 90),
             d.confidence.map(|c| format!("{c:.2}")).unwrap_or_else(|| "—".to_string()),
             d.model.as_deref().map(cell).unwrap_or_else(|| "—".to_string()),
-            excerpt(&d.rationale, 100),
-            d.reasoning_trace.as_deref().map(|t| excerpt(t, 200)).unwrap_or_else(|| "—".to_string()),
+            d.reasoning_trace.as_deref().map(|t| excerpt(t, 120)).unwrap_or_else(|| "—".to_string()),
         ));
     }
     out
@@ -165,15 +194,27 @@ pub fn render_markdown(run_prefix: &str, subs: &[SubmissionRow], decs: &[Decisio
 /// run_id+attempt) with the FULL Reasoning Trace. Explorer links + Commitment deltas are
 /// precomputed so the JSONL stands alone. Pure over the fetched rows.
 pub fn render_jsonl(run_prefix: &str, subs: &[SubmissionRow], decs: &[DecisionRow]) -> String {
+    // Index decisions by (run_id, attempt) once, so the per-Submission join is O(1) instead of
+    // scanning every decision per Submission (O(N·M)). N is small today, but the index keeps the
+    // join honest as a Run grows.
+    let by_key: std::collections::HashMap<(&str, i64), &DecisionRow> = decs
+        .iter()
+        .map(|d| ((d.run_id.as_str(), d.attempt), d))
+        .collect();
     let mut out = String::new();
     for s in subs {
-        let decision = decs
-            .iter()
-            .find(|d| d.run_id == s.run_id && d.attempt == s.attempt)
+        let decision = by_key
+            .get(&(s.run_id.as_str(), s.attempt))
             .map(|d| {
                 serde_json::json!({
-                    "failure_class": d.failure_class,
-                    "remedy": d.remedy,
+                    // The four-class verdict + the action it implies — kept for the agent-vs-baseline
+                    // contrast (ADR 0012), no longer the Agent's input.
+                    "baseline_class": d.failure_class,
+                    "baseline_remedy": d.baseline_remedy,
+                    // The Agent's reasoned output: the open-ended cause + the recovery bucket.
+                    "diagnosis": d.diagnosis,
+                    "triage": d.triage,
+                    "remedy": d.remedy, // the action the Agent chose (vs. baseline_remedy)
                     "rationale": d.rationale,
                     "confidence": d.confidence,
                     "model": d.model,
@@ -253,6 +294,9 @@ mod tests {
             attempt,
             failure_class: "expired_blockhash".to_string(),
             remedy: "refresh_blockhash".to_string(),
+            baseline_remedy: Some("refresh_blockhash".to_string()),
+            diagnosis: Some("The recent blockhash aged past its ~150-slot validity window.".to_string()),
+            triage: Some("recoverable_by_refresh".to_string()),
             rationale: "Blockhash aged past its validity window; refreshing is the canonical recovery.".to_string(),
             confidence: Some(0.98),
             reasoning_trace: trace.map(String::from),
@@ -332,6 +376,70 @@ mod tests {
     }
 
     #[test]
+    fn markdown_decisions_contrast_baseline_blind_against_distinct_diagnoses() {
+        // Two Submissions the four-class baseline BOTH collapses to `bundle_failure → abort`,
+        // but the Agent tells apart (ADR 0012): one funding, one permanent, distinct diagnoses.
+        let blind = |run_id: &str, triage: &str, diagnosis: &str, conf: f64| DecisionRow {
+            run_id: run_id.to_string(),
+            attempt: 1,
+            failure_class: "bundle_failure".to_string(),
+            remedy: "abort".to_string(),
+            baseline_remedy: Some("abort".to_string()),
+            diagnosis: Some(diagnosis.to_string()),
+            triage: Some(triage.to_string()),
+            rationale: "r".to_string(),
+            confidence: Some(conf),
+            reasoning_trace: Some("t".to_string()),
+            model: Some("anthropic/x".to_string()),
+            decided_at: 1,
+        };
+        let decs = [
+            blind("run-100-p2", "funding", "Self-transfer needs more lamports than the payer holds.", 0.95),
+            blind("run-100-p5", "permanent", "Orca Whirlpool rejected the ix with Custom(101) — InstructionFallbackNotFound.", 0.98),
+        ];
+        let md = render_markdown("run-100", &[], &decs);
+        // The baseline cell is IDENTICAL + blind-flagged for both — the collapse is visible...
+        assert_eq!(
+            md.matches("bundle_failure → abort ⚠").count(),
+            2,
+            "the catch-all baseline assigns the same blind verdict to both"
+        );
+        // ...yet the Agent triages them differently, each with its own diagnosis.
+        assert!(md.contains("funding → abort"), "the funding case's agent cell");
+        assert!(md.contains("permanent → abort"), "the permanent case's agent cell");
+        assert!(md.contains("more lamports than the payer holds"), "the funding diagnosis");
+        assert!(md.contains("InstructionFallbackNotFound"), "the permanent diagnosis");
+    }
+
+    #[test]
+    fn markdown_recoverable_baseline_has_no_blind_marker() {
+        // A bounded fault the baseline classifies precisely (expired_blockhash) carries NO ⚠ —
+        // the marker is reserved for the catch-all the Diagnosis disambiguates.
+        let md = render_markdown("run-100", &[], &[dec("run-100-p0", 1, Some("trace"))]);
+        assert!(md.contains("expired_blockhash → refresh_blockhash"), "precise baseline verdict");
+        assert!(md.contains("recoverable_by_refresh → refresh_blockhash"), "the agent triage → remedy cell");
+        // The ⚠ blind marker is reserved for the catch-all: the legend mentions it, but this row
+        // (a precisely-classified failure) must not carry it.
+        let row = md.lines().find(|l| l.contains("expired_blockhash → refresh_blockhash")).expect("decision row");
+        assert!(!row.contains('⚠'), "a precisely-classified failure row is not flagged blind");
+    }
+
+    #[test]
+    fn jsonl_decision_carries_diagnosis_triage_and_baseline_contrast() {
+        // The lossless JSONL keeps the ADR 0012 fields: the baseline contrast + the Agent's read.
+        let subs = [sub("run-100-p0", 1, None, Some("expired_blockhash"))];
+        let decs = [dec("run-100-p0", 1, Some("trace"))];
+        let jsonl = render_jsonl("run-100", &subs, &decs);
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let d = &line["decision"];
+        assert_eq!(d["baseline_class"], "expired_blockhash", "the four-class verdict, kept for contrast");
+        assert_eq!(d["baseline_remedy"], "refresh_blockhash", "what the baseline would do");
+        assert_eq!(d["triage"], "recoverable_by_refresh", "the Agent's recovery bucket");
+        assert_eq!(d["remedy"], "refresh_blockhash", "the Agent's chosen action");
+        assert!(d["diagnosis"].as_str().unwrap().contains("validity window"), "the Agent's plain-language cause");
+    }
+
+    #[test]
     fn cell_escapes_pipes_and_flattens_newlines() {
         // A bare pipe would open a new column; a newline would break the row.
         assert_eq!(cell("a | b"), "a \\| b", "a pipe is backslash-escaped");
@@ -398,7 +506,7 @@ mod tests {
     #[test]
     fn write_lifecycle_log_renders_files_from_a_store() {
         // End-to-end shell: seed a Run in SQLite, write both artifacts, read them back.
-        use crate::model::{FailureClass, Remedy};
+        use crate::model::{FailureClass, Remedy, Triage};
         use crate::storage::{NewSubmission, Store};
         let store = Store::open(":memory:").unwrap();
         store.init_schema().unwrap();
@@ -409,6 +517,7 @@ mod tests {
         }).unwrap();
         store.set_failure_class("run-7-p0", 1, "n1", FailureClass::ExpiredBlockhash).unwrap();
         store.record_decision("run-7-p0", 1, FailureClass::ExpiredBlockhash, Remedy::RefreshBlockhash,
+            Remedy::RefreshBlockhash, Some("blockhash aged out"), Some(Triage::RecoverableByRefresh),
             "rationale", Some(0.91), Some("full trace text"), Some("anthropic/claude-4.6-sonnet-20260217"), 5).unwrap();
         // p1: a clean, landed Submission.
         store.record_submission(&NewSubmission {

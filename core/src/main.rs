@@ -67,6 +67,15 @@ async fn main() -> Result<()> {
         return leader_probe(&cfg).await;
     }
 
+    // Deadline-response probe (ARGUS_PROBE=1): a feasibility sweep, NOT a graded path.
+    // Send real bundles at the adaptive p75 tip while varying the blockhash AGE (the
+    // deadline knob — (~150 - age) slots of validity remain), and measure landing rate +
+    // slots-to-land per age. Answers: how tight must a deadline be before landing goes
+    // marginal — the empirical input for whether the "race vs. abort" decision has teeth.
+    if std::env::var("ARGUS_PROBE").is_ok() {
+        return deadline_probe(&cfg).await;
+    }
+
     // Lifecycle run (ARGUS_LIFECYCLE=1): submit ONE real bundle and track it through
     // both Yellowstone streams into SQLite (ADR 0004) — the Day 3-4 deliverable.
     if std::env::var("ARGUS_LIFECYCLE").is_ok() {
@@ -418,6 +427,105 @@ fn stage_delta_ms(a: Option<u128>, b: Option<u128>) -> i64 {
     }
 }
 
+/// Deadline-response probe (ARGUS_PROBE=1): a feasibility sweep, NOT a graded artifact.
+/// For each blockhash AGE in a marginal-weighted sweep, send a real bundle at the adaptive
+/// p75 tip and poll Jito for landing — measuring whether a bundle with only ~(150 - age)
+/// slots of validity left can land in time. The land-rate curve across ages is the empirical
+/// answer to "how tight a deadline before 'race vs. abort' actually bites." Cheap: a
+/// non-landing bundle pays no tip (tips bill only on inclusion).
+async fn deadline_probe(cfg: &config::Config) -> Result<()> {
+    use solana_sdk::signer::Signer;
+
+    let payer = wallet::load_keypair(&cfg.keypair_path)?;
+    let tip = tip::fetch_tip_lamports(&cfg.jito_tip_floor_url, 75).await.unwrap_or(5_000);
+    let regions = bundle::regional_endpoints();
+    let auth = cfg.jito_auth_uuid.as_deref();
+    let tip_accounts = bundle::published_tip_accounts();
+    if tip_accounts.is_empty() {
+        anyhow::bail!("PROBE: no published Jito tip accounts — cannot build a tippable bundle");
+    }
+    info!(payer = %payer.pubkey(), tip, regions = regions.len(),
+        "PROBE: deadline-response sweep — adaptive p75 tip, varying blockhash age");
+
+    // Blockhash age in slots (the deadline knob). Validity ~150 slots; landing was observed
+    // at ~5 slots in the live Run, so the bite is near age ~143+ — sample densely there. The
+    // effective age runs a few slots over the requested one (fetch+build+submit slippage),
+    // which only sharpens the tail. The two cheap anchors (0, 110) confirm the un-pressured
+    // baseline lands at all.
+    let ages: [u64; 12] = [0, 110, 130, 130, 138, 138, 142, 142, 142, 145, 145, 145];
+
+    // (age, budget_slots, landed, slots_to_land). `landed` is tracked SEPARATELY from the
+    // slots-to-land delta: a bundle can land while the submit-slot read failed, leaving the delta
+    // unknown — folding "unknown delta" into "didn't land" would undercount the land rate.
+    let mut rows: Vec<(u64, i64, bool, Option<i64>)> = Vec::new();
+    for (i, age) in ages.into_iter().enumerate() {
+        // `None` if the slot read failed — then a landing's slots-to-land delta is left unknown
+        // rather than computed against a fabricated 0 (which printed an absolute-slot garbage delta).
+        let submit_slot = rpc::get_slot(&cfg.rpc_http_url).await.ok();
+        let blockhash = if age == 0 {
+            rpc::get_latest_blockhash(&cfg.rpc_http_url).await?
+        } else {
+            rpc::get_aged_blockhash(&cfg.rpc_http_url, age).await?
+        };
+        let budget = (150i64 - age as i64).max(0); // slots of validity left at submit (never negative)
+        let nonce = format!("probe-{}-a{age}-{i}", now_millis());
+        let params = bundle::BundleParams {
+            payer: &payer,
+            recent_blockhash: blockhash,
+            nonce: &nonce,
+            tip_account: tip_accounts[i % tip_accounts.len()],
+            tip_lamports: tip,
+            self_transfer_lamports: 1,
+            compute_unit_limit: None,
+            priority_fee_microlamports: None,
+        };
+        let txs = bundle::build_bundle(&params)?;
+        let signature = txs[0].signatures[0].to_string();
+        let send = bundle::submit_all_regions(&regions, &txs, auth).await;
+        let landed_via = send.iter().find_map(|(reg, r)| r.as_ref().ok().map(|b| (reg.clone(), b.clone())));
+
+        match landed_via {
+            None => {
+                warn!(age, %signature, "PROBE: no region accepted — counting as non-landing");
+                rows.push((age, budget, false, None));
+            }
+            Some((region, bundle_id)) => {
+                // Poll up to ~16s (40 × 400ms) — generous vs the observed ~2s landing.
+                let landed = bundle::await_landed(&region, &bundle_id, 40, 400).await.unwrap_or(None);
+                match landed {
+                    Some(slot) => {
+                        // Delta only when the submit-slot was actually read; else left unknown.
+                        let stl = submit_slot.map(|ss| slot as i64 - ss as i64);
+                        info!(age, budget, slots_to_land = ?stl, landed_slot = slot, %signature, "PROBE: ✅ landed in time");
+                        rows.push((age, budget, true, stl));
+                    }
+                    None => {
+                        info!(age, budget, %signature, "PROBE: ✗ did not land within the window (deadline missed)");
+                        rows.push((age, budget, false, None));
+                    }
+                }
+            }
+        }
+    }
+
+    // Collapse to a land-rate curve by age — the decision input.
+    info!("PROBE: ===== deadline-response curve =====");
+    let mut ages_seen: Vec<u64> = rows.iter().map(|r| r.0).collect();
+    ages_seen.sort_unstable();
+    ages_seen.dedup();
+    for age in ages_seen {
+        let bucket: Vec<&(u64, i64, bool, Option<i64>)> = rows.iter().filter(|r| r.0 == age).collect();
+        let n = bucket.len();
+        let landed = bucket.iter().filter(|r| r.2).count();
+        let budget = bucket.first().map(|r| r.1).unwrap_or(0);
+        let stls: Vec<i64> = bucket.iter().filter_map(|r| r.3).collect();
+        let avg = if stls.is_empty() { "—".to_string() } else { format!("{:.1}", stls.iter().sum::<i64>() as f64 / stls.len() as f64) };
+        info!(age, budget_slots = budget, landed, of = n, avg_slots_to_land = %avg, "PROBE: age {age} → {landed}/{n} landed");
+    }
+    info!("PROBE: done — the marginal age is where land-rate falls from ~all to ~none");
+    Ok(())
+}
+
 /// Live lifecycle run (ARGUS_LIFECYCLE=1): submit ONE real Jito bundle and track it
 /// through the two-stream model (ADR 0004) — Inclusion (transaction stream) +
 /// Commitment Progression (slot stream) — persisting submitted/landed/processed/
@@ -521,10 +629,17 @@ async fn run_orchestrator(cfg: &config::Config, store: &storage::Store) -> Resul
 
     // The Run prefix; each Payload runs under a child run_id `run-{ts}-p{k}` (ADR 0011).
     let run_prefix = format!("run-{}", now_millis());
+    // The deterministic injections: the three bounded faults the four-class baseline handles,
+    // then the foreign-program spread (ADR 0012) — three real programs that reject an identical
+    // garbage instruction with DISTINCT errors the baseline collapses to one blind abort, but the
+    // Agent diagnoses individually. All three abort (permanent/funding) → non-landing → zero SOL.
     let injections = [
         failure::Injection::ExpiredBlockhash,
         failure::Injection::ComputeExceeded,
         failure::Injection::BundleFailure,
+        failure::Injection::ForeignProgram(failure::ForeignFault::Memo),
+        failure::Injection::ForeignProgram(failure::ForeignFault::Token),
+        failure::Injection::ForeignProgram(failure::ForeignFault::Whirlpool),
     ];
     let total = injections.len() + cfg.run_clean_count;
     info!(%run_prefix, injections = injections.len(), clean = cfg.run_clean_count, total,
@@ -873,6 +988,11 @@ async fn injection_run(
             None,
             Some(failure::failing_payload(&payer.pubkey(), &nonce, 1)),
         ),
+        Injection::ForeignProgram(fault) => (
+            rpc::get_latest_blockhash(&cfg.rpc_http_url).await?,
+            None,
+            Some(failure::foreign_fault_payload(fault, &payer.pubkey(), &nonce)),
+        ),
     };
     let params = bundle::BundleParams {
         payer,
@@ -944,10 +1064,18 @@ async fn injection_run(
     let (tip_floor_p50, tip_floor_p75, current_slot) =
         (tip_floor_p50.ok(), tip_floor_p75.ok(), current_slot.ok());
     let bump_floor = tip_floor_p75.unwrap_or(base_tip);
+    // The raw failure surface the Agent reasons over instead of the four-class verdict
+    // (ADR 0012): the failing program (parsed from the logs), the structured error variant,
+    // and the full program logs. `failure_class` is still set on the context but is
+    // `serde(skip)` — kept for the Local policy / baseline column, never sent to the Agent.
+    let failing_pid = failure::failing_program_id(&sim.logs);
     let ctx = agent_client::FailureContext {
         failure_class: class,
         attempt: attempt as u32,
         error_text: &err_text,
+        instruction_error: sim.instruction_error.as_deref(),
+        failing_program_id: failing_pid.as_deref(),
+        program_logs: &sim.logs,
         tip_lamports: base_tip,
         tip_floor_p50,
         tip_floor_p75,
@@ -957,7 +1085,7 @@ async fn injection_run(
         cu_used: sim.units_consumed,
         current_slot,
     };
-    let decision = policy.decide(&ctx).await?;
+    let decision = policy.decide(&ctx).await;
     // ADR 0006: a scored decision must carry a Reasoning Trace. On the Agent path, warn
     // loudly if it came back empty (provider hiccup / non-reasoning fallback model) so the
     // gap is caught live during the Run, not at Lifecycle-Log assembly. The decision is
@@ -974,18 +1102,25 @@ async fn injection_run(
                 "INJECT: agent decision recorded with EMPTY model slug — provenance gap (ADR 0006)");
         }
     }
+    // The baseline contrast (ADR 0012): what the four-class default policy WOULD do for this
+    // class, persisted next to the Agent's chosen remedy + diagnosis + triage. Computed here,
+    // where `default_remedy` is in scope, so `storage` stays a policy-free sink.
+    let baseline_remedy = failure::default_remedy(class);
     store.record_decision(
         run_id,
         attempt,
         class,
         decision.remedy,
+        baseline_remedy,
+        decision.diagnosis.as_deref(),
+        decision.triage,
         &decision.rationale,
         Some(decision.confidence),
         decision.reasoning_trace.as_deref(),
         decision.model.as_deref(),
         now_millis() as i64,
     )?;
-    info!(?class, remedy = ?decision.remedy, model = ?decision.model, confidence = decision.confidence, rationale = %decision.rationale, "INJECT: Remedy chosen");
+    info!(?class, remedy = ?decision.remedy, triage = ?decision.triage, model = ?decision.model, confidence = decision.confidence, failing_program = ?failing_pid, diagnosis = ?decision.diagnosis, rationale = %decision.rationale, "INJECT: Diagnosis + Remedy chosen (baseline class shown for contrast)");
 
     // 4) Execute the Remedy hook: next-attempt state, or stop on Abort. For a compute
     // remedy, observe the TRUE CU need from a max-CU re-simulation of the clean attempt-2

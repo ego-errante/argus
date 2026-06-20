@@ -17,21 +17,34 @@ const FALLBACKS = (process.env.AGENT_MODEL_FALLBACKS ?? "")
   .filter(Boolean);
 const REASONING_MAX_TOKENS = Number(process.env.AGENT_REASONING_MAX_TOKENS ?? 2048);
 
-const SYSTEM = `You are the failure-recovery agent inside Argus, a Solana smart-transaction stack.
-A Jito bundle Submission has failed. Given the failure context, diagnose the cause and choose
-exactly ONE Remedy, then call submit_decision with it:
+const SYSTEM = `You are the failure-diagnosis agent inside Argus, a Solana smart-transaction stack.
+A Jito bundle Submission failed in preflight simulation. You are given the RAW failure surface —
+the structured instruction error, the program that rejected the transaction (failing_program_id),
+and that program's logs (program_logs) — NOT a pre-assigned failure category. Reason from it.
 
-- refresh_blockhash : the blockhash expired or is too old to land; fetch a fresh one.
-- bump_tip          : the bundle is losing the Jito auction (fee too low / not landing); raise the tip.
-- raise_cu_limit    : the transaction exceeded its compute-unit limit.
-- hold_and_resubmit : conditions are unfavorable right now; wait for a better leader window.
-- abort             : the failure is non-recoverable (e.g. a deterministically failing instruction); stop.
+Do three things, then call submit_decision exactly once:
 
-Reason from the SPECIFIC numbers in the context (blockhash age vs the ~150-slot validity window,
-tip vs the live tip-floor percentiles, cu_used vs cu_limit, the error text). Different failure
-classes should generally lead to different remedies — do not apply a fixed sequence. State your
-confidence honestly. This is a real operational decision, not a script. Always finish by calling
-submit_decision exactly once.`;
+1. DIAGNOSE. Identify the failing program and decode its SPECIFIC error. Program error codes are
+   program-relative: the same Custom(N) means different things in different programs (e.g. an
+   Anchor Custom(101) is InstructionFallbackNotFound; SPL-Token Custom(1) is insufficient funds).
+   The program_logs usually describe the cause in words — read them. State, in plain language,
+   what actually went wrong.
+
+2. TRIAGE into exactly one bucket:
+   - recoverable_by_refresh      : a stale/expired blockhash; a fresh blockhash will land it.
+   - recoverable_by_modification : a parameter is wrong but the action is sound (raise the CU
+                                   limit, widen slippage, fix an amount); a MODIFIED retry can land.
+   - permanent                   : the program rejected the instruction itself (unknown/malformed
+                                   instruction, frozen account, failed logic check); retrying will not help.
+   - funding                     : insufficient lamports/balance/rent for the action as written.
+
+3. REMEDY — the action the Core executes: refresh_blockhash | raise_cu_limit | bump_tip |
+   hold_and_resubmit | abort. Choose the one your triage implies (permanent, and funding with no
+   in-tx fix, → abort; aborting with a correct diagnosis is a valid, useful outcome).
+
+Do NOT apply a fixed error→remedy mapping — reason from THIS program's error and logs, and from the
+context numbers (blockhash age vs the ~150-slot window, cu_used vs cu_limit, tip vs the tip floor).
+State your confidence honestly. This is a real operational decision, not a script.`;
 
 // Structured-output channel. tool_choice stays "auto" (not forced): forcing a tool can
 // suppress or conflict with reasoning on some providers, and the Reasoning Trace is a hard
@@ -40,18 +53,26 @@ const DECISION_TOOL: OpenAI.Chat.ChatCompletionTool = {
   type: "function",
   function: {
     name: "submit_decision",
-    description: "Submit your chosen remedy for the failed bundle.",
+    description: "Submit your diagnosis, triage, and chosen remedy for the failed bundle.",
     parameters: {
       type: "object",
       properties: {
+        diagnosis: {
+          type: "string",
+          description: "Plain-language cause, decoded from the failing program and its logs.",
+        },
+        triage: {
+          type: "string",
+          enum: ["recoverable_by_refresh", "recoverable_by_modification", "permanent", "funding"],
+        },
         remedy: {
           type: "string",
           enum: ["refresh_blockhash", "bump_tip", "raise_cu_limit", "hold_and_resubmit", "abort"],
         },
-        rationale: { type: "string", description: "Why this remedy, grounded in the context numbers." },
+        rationale: { type: "string", description: "Why this remedy follows from the diagnosis + triage." },
         confidence: { type: "number", description: "0.0-1.0." },
       },
-      required: ["remedy", "rationale", "confidence"],
+      required: ["diagnosis", "triage", "remedy", "rationale", "confidence"],
     },
   },
 };

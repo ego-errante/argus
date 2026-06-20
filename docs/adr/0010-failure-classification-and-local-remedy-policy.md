@@ -19,6 +19,8 @@ A Jito bundle is all-or-nothing, so a faulted transaction never lands and leaves
 
 > **Amended by ADR 0011 (Day 11, 2026-06-19):** the faulted attempt-1 is no longer withheld from the Block Engine. For the Run it is **sent** (free — non-landing pays no tip), making each injected Failure a real, non-landing Submission that counts toward "≥10 real bundle submissions." The preflight simulation here stays exactly as described — it remains the *classification* source; only the doomed bundle's suppression is reversed.
 
+> **Further amended by ADR 0012 (2026-06-20):** `classify_failure` and `default_remedy` are **demoted** — they are no longer the Agent's input, but the deterministic *baseline* the Agent's Diagnosis is graded against (and the agent-unreachable fallback, with ADR 0006 provenance unchanged). The Agent now reads the raw failure surface (`instruction_error` + program `logs` + program ID) instead of the four-class verdict. Preflight simulation stays the reason source exactly as described here; `apply_remedy` is untouched. Verified 2026-06-20 that simulation surfaces distinct foreign-program errors (`Custom(12)`, `Custom(101)`, `InvalidInstructionData`) with diagnostic logs that the four-class map collapses to one blind `BundleFailure → abort` — the gap ADR 0012 closes.
+
 ## Hardening (2026-06-18)
 
 A `/code-review ultra` pass replaced two fragile shortcuts:

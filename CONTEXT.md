@@ -1,6 +1,6 @@
 # Argus
 
-Named for Argus Panoptes, the hundred-eyed watchman of Greek myth — the system never stops watching the network. Argus is a Solana transaction-infrastructure system that observes the network in real time, submits Jito bundles intelligently, tracks each submission across commitment levels, and delegates one operational decision — failure recovery — to an AI agent. Built for the Superteam Nigeria "Advanced Infrastructure Challenge."
+Named for Argus Panoptes, the hundred-eyed watchman of Greek myth — the system never stops watching the network. Argus is a Solana transaction-infrastructure system that observes the network in real time, submits Jito bundles intelligently, tracks each submission across commitment levels, and delegates one operational decision — failure diagnosis — to an AI agent. Built for the Superteam Nigeria "Advanced Infrastructure Challenge."
 
 This glossary is the shared language for the codebase, the architecture document, and the README. The transaction domain is terminology-dense and several terms are overloaded (especially "confirmed"), so definitions here are deliberately opinionated.
 
@@ -17,7 +17,7 @@ The Rust service that touches the network: streams from Yellowstone, builds and 
 _Avoid_: backend, server, engine
 
 **Agent**:
-The separate TypeScript service that owns the failure-recovery decision. It receives failure context over HTTP and returns a chosen Remedy with reasoning. It holds no transaction logic of its own.
+The separate TypeScript service that owns the failure-diagnosis decision. It receives the raw failure surface over HTTP and returns a Diagnosis — the cause, a Triage, and the Remedy to execute — with its Reasoning Trace. It holds no transaction logic of its own.
 _Avoid_: AI layer, LLM, model, brain
 
 ### Transaction Lifecycle
@@ -95,7 +95,7 @@ _Avoid_: tip wallet
 ### Failure & Recovery
 
 **Failure Class**:
-The classified cause of a non-landing Submission. Exactly four: Expired Blockhash, Fee Too Low, Compute Exceeded, Bundle Failure.
+The classified cause of a non-landing Submission, drawn from a fixed set of four: Expired Blockhash, Fee Too Low, Compute Exceeded, Bundle Failure. The Core's deterministic **baseline** taxonomy — retained as the comparison the Agent's Diagnosis is measured against (and the fallback when the Agent is unreachable), no longer the Agent's input.
 _Avoid_: error type, failure reason
 
 **Fault Injection**:
@@ -111,8 +111,8 @@ A Failure Class where the transaction's blockhash aged past its ~150-slot validi
 _Avoid_: timeout, stale transaction
 
 **Remedy**:
-The single action the Agent chooses in response to a Failure, drawn from a fixed decision space: refresh blockhash, bump Tip, raise CU limit, hold-and-resubmit, or abort. Executed by the Core.
-_Avoid_: fix, retry strategy, action (use "Remedy" specifically for the Agent's chosen response)
+The executable action that recovers an Attempt — refresh blockhash, bump Tip, raise CU limit, hold-and-resubmit, or abort. The Agent names it as part of its Diagnosis; the Core executes it and owns its magnitudes (see [ADR 0005](docs/adr/0005-dynamic-tip-ownership.md)). The set is fixed and enumerated so execution is auditable.
+_Avoid_: fix, retry strategy, action (use "Remedy" specifically for the chosen recovery action)
 
 ### AI Agent
 
@@ -120,6 +120,14 @@ _Avoid_: fix, retry strategy, action (use "Remedy" specifically for the Agent's 
 The Agent's extended-thinking output logged alongside each decision, together with the input context, chosen Remedy, and outcome. The primary evidence that the Agent reasons rather than runs a script.
 _Avoid_: explanation, log (too generic), chain-of-thought
 
+**Diagnosis**:
+The Agent's owned decision: a plain-language read of why a Failure occurred — inferred from the raw failure surface (the program that rejected the transaction and the error and logs it emitted), not from a pre-assigned Failure Class — together with a Triage and the Remedy to execute. The diagnosis is open-ended; an unbounded spread of real program errors has no fixed enumeration to look it up in. That openness is what distinguishes reasoning from a lookup.
+_Avoid_: classification, error message, the Failure Class (the Diagnosis is upstream of it)
+
+**Triage**:
+The Agent's sorting of a diagnosed Failure into one of four recovery-relevant buckets — recoverable-by-refresh, recoverable-by-modification, permanent, or funding — derived from the Diagnosis. The axis the Agent reasons on, distinct from the Core's four-class baseline taxonomy.
+_Avoid_: Failure Class (the baseline taxonomy, not this), severity
+
 **Decision Space**:
-The closed set of Remedies the Agent may choose from. Fixed and enumerated so the Agent's choice — and its variation across Failure Classes — is auditable.
+The Remedy set the Agent's Diagnosis selects its action from: refresh blockhash, bump Tip, raise CU limit, hold-and-resubmit, abort. Fixed and enumerated so the *action* is auditable — but the action is only the tail of the Diagnosis; the reasoned, open-ended part is the cause and the Triage.
 _Avoid_: options, choices

@@ -23,8 +23,11 @@ CREATE TABLE IF NOT EXISTS decisions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id          TEXT    NOT NULL,
     attempt         INTEGER NOT NULL,
-    failure_class   TEXT    NOT NULL,
-    remedy          TEXT    NOT NULL,          -- refresh_blockhash | bump_tip | raise_cu_limit | hold_and_resubmit | abort
+    failure_class   TEXT    NOT NULL,          -- the Core's four-class BASELINE verdict (ADR 0012: shown for contrast, NOT the Agent's input)
+    remedy          TEXT    NOT NULL,          -- the Agent's chosen action: refresh_blockhash | bump_tip | raise_cu_limit | hold_and_resubmit | abort
+    baseline_remedy TEXT,                      -- what the baseline (default_remedy of failure_class) would do — the agent-vs-baseline contrast (ADR 0012)
+    diagnosis       TEXT,                      -- the Agent's plain-language cause, decoded from the raw failure surface (ADR 0012; NULL on local paths)
+    triage          TEXT,                      -- the Agent's recovery bucket: recoverable_by_refresh | recoverable_by_modification | permanent | funding (NULL on local paths)
     rationale       TEXT    NOT NULL,
     confidence      REAL,
     reasoning_trace TEXT,                      -- summarized thinking — the visible-reasoning evidence
