@@ -30,9 +30,13 @@ argus/
 ```bash
 cp .env.example .env        # then fill in SolInfra endpoints + OPENROUTER_API_KEY (see docs/PLAN.md)
 
-# Run the two services locally:
+# 1) Start the Agent first — a scored Run health-checks it and refuses to start if it's down:
 make agent                  # TS agent on :8787  (needs OPENROUTER_API_KEY)
-make core                   # Rust core (prints "scaffold ready" until the Day 1-2 tracer bullet lands)
+
+# 2) Drive the Core (reads .env; an env flag selects the mode):
+make core                                                 # health/liveness check, no submission
+ARGUS_LIFECYCLE=1 cargo run -p argus-core                 # submit ONE real bundle, track it to finalized
+ARGUS_RUN=1 ARGUS_POLICY=agent cargo run -p argus-core    # the graded Run (ADR 0011): 6 injections + 7 clean, Agent diagnoses each failure
 
 # Or both in containers:
 make up
@@ -46,6 +50,19 @@ make up
 
 ## Status
 
-**Live on mainnet.** The full stack runs end-to-end: Yellowstone slot/tx streaming, leader-window-timed Jito bundles with dynamic Tip-Floor tips, commitment-progression lifecycle tracking to SQLite, and the Agent's failure-diagnosis decision over OpenRouter. A graded recording Run (`ARGUS_RUN=1`, ADR 0011) has landed **12 Submissions / 3 Failures / 9 landed** on mainnet with full Reasoning Traces (`logs/lifecycle-*.{md,jsonl}`).
+**Live on mainnet.** The full stack runs end-to-end: Yellowstone slot/tx streaming, leader-window-timed Jito bundles with dynamic Tip-Floor tips, commitment-progression lifecycle tracking to SQLite, and the Agent's failure-diagnosis decision over OpenRouter. A graded recording Run (`ARGUS_RUN=1`, ADR 0011) landed **15 Submissions / 6 Failures / 9 landed** on mainnet with full Reasoning Traces, for **0.000135 SOL** total (the 6 faulted bundles never landed → no tip charged) — see `logs/lifecycle-1781958744615.{md,jsonl}`.
 
-The Agent reasons over the **raw failure surface** — the failing program, its structured instruction error, and its logs — and returns an open-ended **Diagnosis** + a **Triage** + the **Remedy** (ADR 0012); the four-class taxonomy is retained as the *baseline* the Diagnosis is measured against, not the Agent's input. The foreign-program spread (Memo / Token / Whirlpool) shows the point: one identical malformed instruction draws three DISTINCT program-specific diagnoses where the baseline collapses all three to one blind `bundle_failure → abort`. See **docs/PLAN.md** for the day-by-day sequence and **docs/adr/** for the decisions.
+The Agent reasons over the **raw failure surface** — the failing program, its structured instruction error, and its logs — and returns an open-ended **Diagnosis** + a **Triage** + the **Remedy** (ADR 0012); the four-class taxonomy is retained as the *baseline* the Diagnosis is measured against, not the Agent's input. The foreign-program spread shows the point: in that Run, **four** payloads the baseline collapses to one identical blind `bundle_failure → abort` — a System-Program funding shortfall plus three malformed foreign calls (**Memo → `InvalidInstructionData`**, **SPL-Token → `Custom(12)`**, **Orca Whirlpool → `Custom(101)` `InstructionFallbackNotFound`**) — drew **four DISTINCT** program-specific diagnoses, each at 0.97–0.98 confidence. The two recoverable injections (expired blockhash, CU-exceeded) were triaged and **landed on attempt 2**. See **docs/PLAN.md** for the day-by-day sequence and **docs/adr/** for the decisions.
+
+## Three questions, answered from the graded Run
+
+The numbers below are from `run-1781958744615` (`logs/lifecycle-1781958744615.{md,jsonl}`), 9 landed Submissions on mainnet.
+
+**1. What does the `processed → confirmed` time delta represent?**
+It's the cluster's **vote-aggregation latency**, not inclusion speed. `processed` means a leader has produced the block and we've observed it; `confirmed` (optimistic confirmation) means **≥⅔ of stake has voted** on that block. The delta therefore measures **consensus health / how fast votes propagate and aggregate** — independent of how quickly the transaction itself was included. In this Run it was **87–272 ms (median 123 ms)** across the 9 landed Submissions: sub-quarter-second, i.e. healthy consensus. For contrast, the *next* hop — `confirmed → finalized` — took **~11.8–13.3 s (median ~12.2 s)**, because finalization waits for the block to be rooted (~31 confirmed blocks). Two adjacent deltas, two orders of magnitude apart, measuring different things.
+
+**2. Why not use a `finalized` blockhash for a time-sensitive transaction?**
+A recent blockhash is valid for only **~150 slots (~60–90 s)**. A blockhash fetched at `finalized` commitment is already **~31 slots old** the instant you receive it — you've burned ~20% of the validity window before you've even built, signed, and submitted. For a latency-sensitive bundle that's wasted runway and raises the risk of expiry mid-flight; fetch the **freshest viable** blockhash (`processed`/`confirmed`) instead. The Run demonstrates the failure mode directly: payload **p0** was injected with a blockhash aged **200 slots** (past the ~150 window) → the runtime rejected it at preflight with **`BlockhashNotFound`**, before any instruction executed. The Agent diagnosed exactly that (confidence 0.99), triaged it `recoverable_by_refresh`, and recovery required a **fresh blockhash** — attempt 2 then landed.
+
+**3. What happens if the Jito leader skips their slot?**
+A Jito bundle is **slot-specific** (it targets a Jito-validator leader slot) and **atomic / all-or-nothing**. If that leader skips or fails to build the slot, the bundle is simply **not included** — it is **not** auto-forwarded to the next leader, and because **Jito tips are paid only on inclusion, no tip is charged** for a bundle that never lands. The remedy is to **resubmit to the next Jito leader window**, with a fresh blockhash if the original is near expiry. This Run is the receipt: all **6** faulted bundles were sent "non-landing, free" (zero tip across them), the whole 9-landed Run cost **0.000135 SOL**, and the two *recoverable* faults were resubmitted and **landed on the following attempt**.
