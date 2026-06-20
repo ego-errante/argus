@@ -33,3 +33,33 @@ The four-class classifier collapses all three to `BundleFailure → abort` — b
 - **Lifecycle Log** gains a *Failure Triage* section: agent diagnosis vs. four-class baseline, with a "baseline blind" marker where distinct causes collapsed to one action.
 - **CONTEXT.md** is updated in coordination: the Agent owns *failure diagnosis*; Remedy is demoted to the executed action; Decision Space is reframed; Diagnosis and Triage are added; Failure Class is annotated as the baseline taxonomy.
 - **PLAN.md** (Day 12-14 framing) and the **README** ("owns one decision") will be reframed at write-time.
+
+## Note (2026-06-20): the DEX surface, worked
+
+The clearest illustration of the thesis is a DEX, because a DEX's *entire* error space lands in the one bucket the four-class baseline is blindest in. This note works the argument; it does **not** commit to building it — a live DEX recovery remains the unbuilt "paid stretch" above (the execution mechanic it needs is scoped separately).
+
+**The collapse, in code.** Almost every AMM failure surfaces as `InstructionError(Custom(N))`. `classify_failure` (failure.rs) routes *every* non-compute instruction error to one place:
+
+```rust
+if let Some(ie) = &sim.instruction_error {
+    // ...compute-exceeded check...
+    return Some(FailureClass::BundleFailure);   // every OTHER instruction error
+}
+```
+
+→ `default_remedy(BundleFailure) = Abort`. So the baseline maps the whole DEX tail to **one bucket → one blind action.** It cannot separate "widen 0.3% and you land" from "this pool is dead, stop."
+
+**Four real DEX failures, one classifier bucket, four right answers:**
+
+| Real failure (Whirlpool-style) | Baseline | Agent reads program + code + log → |
+|---|---|---|
+| `AmountOutBelowMinimum` (slippage) | `bundle_failure → abort` | `RecoverableByModification` — widen min-out, retry |
+| `TickArrayNotFound` / price left the range | `bundle_failure → abort` | `RecoverableByModification` — re-quote / new tick array |
+| Insufficient input-token balance | `bundle_failure → abort` | `Funding` — top up, don't retry blind |
+| `PoolPaused` / frozen / `OperationNotAllowed` | `bundle_failure → abort` | `Permanent` — abort, **and say why** |
+
+The baseline is forced into one global policy across all four: abort-everything (loses every recoverable swap — missed fills, bad UX) **or** retry-everything (burns real tips + priority fees re-submitting into dead pools). Neither is correct; the Agent's Triage *is* the difference.
+
+**Why "just add more classes" can't reach this.** The DEX error space is unbounded *and program-relative*. Each AMM (Orca, Raydium, Meteora, Phoenix, Lifinity…) defines its own custom-error enum with its own numbering: `Custom(6022)` is slippage in one program and something unrelated in another. The integer is only meaningful relative to (the program that threw it + that program's IDL/log text at that version). A static classifier would need a maintained per-program, per-version `code → meaning` table for every DEX it might ever touch — combinatorial, perpetually stale, broken by any new pool or program upgrade. The Agent instead reads the raw surface this ADR threads in — `failing_program_id` + `{"Custom":N}` + the self-describing log line (`AnchorError ... Error Code: AmountOutBelowMinimum`) — and infers meaning from program identity + log prose, no table. That generalizes to a DEX it has never seen. This is the same `program ID + log text` argument as the Memo/Token/Whirlpool spread above, sharpened: on a DEX the collapsed tail is not an edge case, it is the common case.
+
+**Why it matters more here than elsewhere.** On a DEX, failure is routine (slippage on volatile pairs) and every retry spends real tip + priority fee. The Agent's read turns "bundle failed, aborted" into either *"auto-recovered — widened slippage, landed attempt 2"* or *"stopped — this pool is paused, here's the log line."* Both correct, neither reachable by a four-bucket classifier, and the choice between them is real money or a real swap saved. The DEX doesn't introduce a new kind of edge — it is the densest concentration of the edge this ADR already claims.

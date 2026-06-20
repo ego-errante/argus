@@ -6,6 +6,18 @@ Built for the Superteam Nigeria **Advanced Infrastructure Challenge**.
 
 > **Core = the eyes** (Rust: streaming, leader window, bundles, tips, lifecycle, baseline failure classification). **Agent = the judgment** (TypeScript: a Claude-powered failure-**diagnosis** decision — it reads the raw failure surface, the failing program + its structured error + its logs, and returns a cause + a Triage + the Remedy, NOT a lookup over a pre-assigned class — ADR 0012). They communicate over HTTP/JSON — the boundary is the architecture.
 
+## Evaluate Argus in 5 minutes
+
+A judge's fast path — what to read, the one thing that proves the thesis, and how to reproduce it.
+
+1. **The thesis (2 min).** Read **[docs/adr/0012](./docs/adr/0012-agent-owns-failure-diagnosis-over-unbounded-tail.md)**: the AI Agent does *not* pick a remedy from a fixed four-class lookup (a `match` could do that) — it reasons over the **raw failure surface** (the failing program + its structured `instruction_error` + its logs) and returns a free-text **Diagnosis** + a **Triage** + the **Remedy**. The four-class taxonomy is demoted to a *baseline contrast column*. Glossary first if needed: **[CONTEXT.md](./CONTEXT.md)**.
+
+2. **The proof (2 min).** Open the graded mainnet Run **[logs/lifecycle-1781958744615.md](./logs/lifecycle-1781958744615.md)** and read the Agent-Decisions table: **four** payloads the baseline collapses to one identical blind `bundle_failure → abort ⚠` — System funding + Memo (`InvalidInstructionData`), SPL-Token (`Custom(12)`), Orca Whirlpool (`Custom(101)`) — drew **four DISTINCT** program-specific diagnoses at 0.97–0.98 confidence. The two recoverable injections (expired blockhash, CU-exceeded) were triaged and **landed on attempt 2**. Whole Run: **15 sent / 6 failed / 9 landed**, real mainnet, **0.000135 SOL** (faulted bundles never land → no tip).
+
+3. **Reproduce it (1 min to kick off).** With `.env` filled and `make build` run once: start the Agent (`make agent`), then `ARGUS_RUN=1 ARGUS_POLICY=agent cargo run -p argus-core`. It health-gates the Agent, sends 6 injections + 7 clean Payloads on mainnet, tracks each to `finalized` via Yellowstone, and re-exports the Lifecycle Log.
+
+One line: **Core (Rust) = the eyes; Agent (TS) = the judgment; the HTTP boundary is the point.** Decisions in **[docs/adr/](./docs/adr/)**.
+
 ## Docs
 
 - **[CONTEXT.md](./CONTEXT.md)** — the glossary (shared language; read this first).
@@ -29,6 +41,7 @@ argus/
 
 ```bash
 cp .env.example .env        # then fill in SolInfra endpoints + OPENROUTER_API_KEY (see docs/PLAN.md)
+make build                  # run ONCE first: builds the Core + installs & typechecks the Agent
 
 # 1) Start the Agent first — a scored Run health-checks it and refuses to start if it's down:
 make agent                  # TS agent on :8787  (needs OPENROUTER_API_KEY)
