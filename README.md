@@ -8,7 +8,7 @@ Built for the Superteam Nigeria **Advanced Infrastructure Challenge**.
 
 ## Evaluate Argus in 5 minutes
 
-A judge's fast path — what to read, the one thing that proves the thesis, and how to reproduce it.
+A judge's fast path — what to read, the one thing that proves the thesis, and how to reproduce it. The full system design lives in the **[hosted architecture document](https://argus-architecture.foolt757.workers.dev/)** (the separately-judged deliverable).
 
 1. **The thesis (2 min).** Read **[docs/adr/0012](./docs/adr/0012-agent-owns-failure-diagnosis-over-unbounded-tail.md)**: the AI Agent does *not* pick a remedy from a fixed four-class lookup (a `match` could do that) — it reasons over the **raw failure surface** (the failing program + its structured `instruction_error` + its logs) and returns a free-text **Diagnosis** + a **Triage** + the **Remedy**. The four-class taxonomy is demoted to a *baseline contrast column*. Glossary first if needed: **[CONTEXT.md](./CONTEXT.md)**.
 
@@ -20,6 +20,7 @@ One line: **Core (Rust) = the eyes; Agent (TS) = the judgment; the HTTP boundary
 
 ## Docs
 
+- **[Architecture document](https://argus-architecture.foolt757.workers.dev/)** — the hosted system design (the separately-judged deliverable; the big-picture *why* and *shape*).
 - **[CONTEXT.md](./CONTEXT.md)** — the glossary (shared language; read this first).
 - **[docs/PLAN.md](./docs/PLAN.md)** — build sequence, requirement map, failure-injection matrix, README-answer prep.
 - **[docs/adr/](./docs/adr/)** — the architectural decisions and why.
